@@ -69,127 +69,122 @@ public class BitGetTradeService implements TradeService {
      * @param user   Пользователь, у которого будет открываться сигнал.
      * @return Результат открытия сигнала.
      */
+    private record PreparationContext(
+            String symbol,
+            String direction,
+            int effectiveLeverage,
+            BigDecimal totalSize,
+            OrderExecutionContext oec
+    ) {}
     @Override
-    public OrderResult openOrder(Signal signal, UserEntity user, SymbolInfo symbolInfo, BigDecimal entryPrice) throws Exception {
-        printPart("OPEN ORDER");
+    public OrderResult openOrder(Signal signal, UserEntity user, SymbolInfo symbolInfo, BigDecimal entryPrice) {
+        long startTime = System.currentTimeMillis();
+        printPart("OPEN ORDER", "User: " + user.getTgId());
         SignalCorrector.correct(signal, BeerjUtils.BITGET);
         custom.info(signal.toString());
-        System.out.println();
 
-        OrderExecutionContext oec = new OrderExecutionContext(StopInProfitTrigger.load(user.getGroup()));
+        try {
+            PreparationContext context = prepareAndValidateOrder(signal, user, symbolInfo, entryPrice);
+            List<Map<String, String>> ordersPayload = buildOrderPayloads(signal, user, symbolInfo, context);
+            List<OrderResult> results = placeOrders(user, context.symbol(), ordersPayload);
 
+            OrderResult firstSuccess = results.stream()
+                    .filter(OrderResult::succes)
+                    .findFirst()
+                    .orElseThrow(() -> new ApiException("No successful orders were placed. Full response: " + results));
+
+            if (signal.getTypeOreder().contains("market")) {
+                setupPostOrderMonitors(signal, user, symbolInfo, context);
+            }
+
+            logExecutionTime(startTime);
+            logger.info("Position placed successfully for user {}", user.getTgId());
+            return OrderResult.ok("Position placed", firstSuccess.id(), context.symbol());
+
+        } catch (Exception e) {
+            logger.error("Failed to open order for user {}: {}", user.getTgId(), e.getMessage(), e);
+            return OrderResult.error("Failed to open order: " + e.getMessage(), "none", signal.getSymbol());
+        }
+    }
+    private PreparationContext prepareAndValidateOrder(Signal signal, UserEntity user, SymbolInfo symbolInfo, BigDecimal entryPrice) throws Exception {
+        String symbol = signal.getSymbol();
         String direction = signal.getDirection();
         int effectiveLeverage = getEffectiveLeverage(symbolInfo.getMaxLever(), Integer.parseInt(user.getPlecho()));
-        BigDecimal leverage = BigDecimal.valueOf(effectiveLeverage);
 
-        long startTimeOpening = System.currentTimeMillis();
-        BitGetOrderOpener opener = new BitGetOrderOpener(signal, security, this);
-
-        String symbol = signal.getSymbol();
-
-        CompletableFuture<Void> marginModeChange = CompletableFuture.supplyAsync(() -> {
-            System.out.println("Change margin mode...");
-            setMarginMode(user, "isolated", symbol);
-            System.out.println("Margin mode changed");
-            return null;
-        });
+        CompletableFuture<Void> marginModeChange = CompletableFuture.runAsync(() -> setMarginMode(user, "isolated", symbol));
         CompletableFuture<OrderResult> changeLeverFuture = CompletableFuture.supplyAsync(() -> changeLeverge(user, symbol, direction.toLowerCase(), effectiveLeverage));
         CompletableFuture<OrderResult> validateOpen = CompletableFuture.supplyAsync(() -> BeerjUtils.valdateOpen(user, signal));
         CompletableFuture<BigDecimal> getPs = CompletableFuture.supplyAsync(() -> BeerjUtils.getPosSize(user, signal, this, entryPrice));
 
         CompletableFuture.allOf(changeLeverFuture, marginModeChange, validateOpen, getPs).join();
 
-        logger.info("Configurated environment.");
-        //----------------------------------------------------------\\
-        logger.info("Validating user. Id: {}, name: {}", user.getTgId(), user.getTgName());
         OrderResult canNext = validateOpen.get();
         if (!canNext.succes()) {
-            logger.warn("This user cannot next open order. Has open position for symbol: {}", symbol);
-            return canNext;
+            throw new ApiException("User cannot open a new order. Reason: " + canNext.message());
         }
-        logger.info("User can open order!\n\n");
-
-        BigDecimal positionSize = getPs.get().multiply(leverage);
-
-        List<String> types = signal.getTypeOreder();
-        BigDecimal oneOrderSize = (new BigDecimal("100.0").divide(BigDecimal.valueOf(types.size()), 5, RoundingMode.HALF_EVEN)).divide(new BigDecimal("100.0"), symbolInfo.getPricePlace(), RoundingMode.HALF_EVEN);
-        BigDecimal totalSize = setSize(symbolInfo, positionSize.multiply(oneOrderSize).setScale(symbolInfo.getVolumePlace(), RoundingMode.HALF_EVEN));
-        custom.warn("Total size before scaling: {}", totalSize);
-
-
-        logger.info("Getting variable values: positionSize: {}, leverage: {}, direction: {}, types size: {}, types: {}", positionSize, leverage, direction, types.size(), types);
-        logger.info("One order size: {}, totalSize: {}\n\n", oneOrderSize, totalSize);
-
-        logger.info("Try change leverage. New lever: {}", effectiveLeverage);
 
         OrderResult leverResult = changeLeverFuture.get();
         if (!leverResult.succes()) {
-            logger.info("Leverage not changed successfuly");
-            marginModeChange.get();
-            return leverResult;
+            throw new ApiException("Failed to change leverage. Reason: " + leverResult.message());
         }
-        logger.info("Leverage changed.\n\n");
 
-        logger.info("Put orders payload.");
+        BigDecimal positionSize = getPs.get().multiply(BigDecimal.valueOf(effectiveLeverage));
+        BigDecimal oneOrderSize = (new BigDecimal("100.0").divide(BigDecimal.valueOf(signal.getTypeOreder().size()), 5, RoundingMode.HALF_EVEN)).divide(new BigDecimal("100.0"), symbolInfo.getPricePlace(), RoundingMode.HALF_EVEN);
+        BigDecimal totalSize = setSize(symbolInfo, positionSize.multiply(oneOrderSize).setScale(symbolInfo.getVolumePlace(), RoundingMode.HALF_EVEN));
+        logger.info("Calculated total size: {}", totalSize);
+
+        return new PreparationContext(symbol, direction, effectiveLeverage, totalSize, new OrderExecutionContext(StopInProfitTrigger.load(user.getGroup())));
+    }
+    private List<Map<String, String>> buildOrderPayloads(Signal signal, UserEntity user, SymbolInfo symbolInfo, PreparationContext context) {
         List<Map<String, String>> ordersPayload = new ArrayList<>();
+        BitGetOrderOpener opener = new BitGetOrderOpener(signal, security, this);
+        List<String> types = signal.getTypeOreder();
+
         if (types.contains("market")) {
-            ordersPayload.add(opener.placeOrder(user, symbol, direction, totalSize, "market", null, effectiveLeverage));
-            logger.info("Added market order to payload.");
+            ordersPayload.add(opener.placeOrder(user, context.symbol(), context.direction(), context.totalSize(), "market", null, context.effectiveLeverage()));
         }
 
         if (types.size() > 1 || !types.contains("market")) {
-            BigDecimal totalMargin = BigDecimal.ZERO;
             for (int i = types.contains("market") ? 1 : 0; i < types.size(); i++) {
-                ordersPayload.add(opener.placeOrder(user, symbol, direction, totalSize, "limit", new BigDecimal(types.get(i)).setScale(symbolInfo.getPricePlace(), RoundingMode.HALF_EVEN), effectiveLeverage));
-                logger.info("Added limit order to payload.");
+                BigDecimal limitPrice = new BigDecimal(types.get(i)).setScale(symbolInfo.getPricePlace(), RoundingMode.HALF_EVEN);
+                ordersPayload.add(opener.placeOrder(user, context.symbol(), context.direction(), context.totalSize(), "limit", limitPrice, context.effectiveLeverage()));
             }
         }
+        logger.info("Built {} order payloads.", ordersPayload.size());
+        return ordersPayload;
+    }
 
-        logger.info("Batch orders payload formed: {}", ordersPayload);
-        List<OrderResult> results = placeOrders(user, symbol, ordersPayload);
-        for (OrderResult result : results) {
-            if (!result.succes()) {
-                return result;
-            }
-        }
-
+    private void setupPostOrderMonitors(Signal signal, UserEntity user, SymbolInfo symbolInfo, PreparationContext context) {
         BitGetWS ws = new BitGetWS(user, security, this);
-        if (types.contains("market")) {
-            try (ExecutorService placeExecutor = Executors.newSingleThreadExecutor()) {
-                CompletableFuture<Void> setupTakes = CompletableFuture.supplyAsync(() -> {
-                    try {
-                        Position position = getPositions(user).stream().filter(p -> p.getSymbol().equals(symbol) && p.getHoldSide().equalsIgnoreCase(direction)).toList().getFirst();
-                        placeStopLoss(user, position, signal.getStopLoss(), symbolInfo, oec);
-                        ws.setStopId(oec.getStopLossId());
-                        custom.info("Setuped sl: {}", oec.getStopLossId());
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-                    oec.setPositioned(true);
-                    return null;
-                });
-                CompletableFuture.allOf(setupTakes).join();
+        OrderExecutionContext oec = context.oec();
 
-                placeExecutor.execute(() -> {
-                    setupTP(signal, user, totalSize, new BigDecimal(signal.getStopLoss()), ws, totalSize, symbolInfo, oec);
-                    custom.info("Setuped tp");
-                    oec.setPositioned(true);
-                });
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
+        // Setup SL first
+        try {
+            Position position = getPositions(user).stream()
+                    .filter(p -> p.getSymbol().equals(context.symbol()) && p.getHoldSide().equalsIgnoreCase(context.direction()))
+                    .findFirst()
+                    .orElseThrow(() -> new ApiException("Could not find open position to set TP/SL."));
+
+            placeStopLoss(user, position, signal.getStopLoss(), symbolInfo, oec);
+            ws.setStopId(oec.getStopLossId());
+            logger.info("Stop-loss placed with ID: {}", oec.getStopLossId());
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to place stop-loss", e);
         }
 
-        long endTimeOpening = System.currentTimeMillis();
-        long totalTimeMillis = endTimeOpening - startTimeOpening;
-        long totalTimeSecs = (endTimeOpening - startTimeOpening) / 1000;
-        logger.info("TOTALS: Order opened for {}ms({}s)", totalTimeMillis, totalTimeSecs);
+        // Setup TP in a separate thread
+        Executors.newSingleThreadExecutor().execute(() -> {
+            setupTP(signal, user, context.totalSize(), new BigDecimal(signal.getStopLoss()), ws, context.totalSize(), symbolInfo, oec);
+            logger.info("Take-profit setup process initiated.");
+        });
 
-        logger.info("Starting position monitor...");
-        startPositionMonitor(user, symbol, signal, totalSize, ws, totalSize, symbolInfo, oec);
-        logger.info("Position monitor started.");
+        startPositionMonitor(user, context.symbol(), signal, ws, symbolInfo, oec);
+    }
 
-        return OrderResult.ok("Position placed, userId: " + user.getTgId() + ", tgName: " + user.getTgName(), results.getFirst().id(), symbol);
+    private void logExecutionTime(long startTime) {
+        long endTime = System.currentTimeMillis();
+        long totalTimeMillis = endTime - startTime;
+        logger.info("TOTALS: Order processing finished in {}ms ({}s)", totalTimeMillis, totalTimeMillis / 1000);
     }
 
     private BigDecimal setSize(SymbolInfo symbolInfo, BigDecimal totalSize) {

@@ -3,6 +3,8 @@ package com.plovdev.bot.modules.databases;
 import com.plovdev.bot.modules.databases.base.Databaseable;
 import com.plovdev.bot.modules.databases.base.Entity;
 import com.plovdev.bot.modules.exceptions.ApiException;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -11,6 +13,19 @@ import java.util.List;
 
 public class UserDB implements Databaseable {
     private final Logger logger = LoggerFactory.getLogger("Bot Base");
+    private static final HikariDataSource ds;
+
+    static {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl("jdbc:sqlite:src/botbase.db");
+        config.setConnectionTestQuery("SELECT 1");
+        config.setPoolName("SQLiteConnectionPool");
+        config.setMaximumPoolSize(10);
+        config.setMinimumIdle(5);
+        config.setLeakDetectionThreshold(15000);
+        config.setConnectionTimeout(30000);
+        ds = new HikariDataSource(config);
+    }
 
     public UserDB() {
         createTable();
@@ -18,7 +33,7 @@ public class UserDB implements Databaseable {
 
     @Override
     public void createTable() {
-        try (Connection con = DriverManager.getConnection("jdbc:sqlite:src/botbase.db");
+        try (Connection con = ds.getConnection();
              Statement stt = con.createStatement()) {
 
             stt.executeUpdate("CREATE TABLE IF NOT EXISTS Users (tgName TEXT, firstName TEXT," +
@@ -37,7 +52,7 @@ public class UserDB implements Databaseable {
         updateDef("Users", "id", keyVal, key, newVal);
     }
     public void updateByUid(String key, String newVal, String keyVal) {
-        try (Connection con = DriverManager.getConnection("jdbc:sqlite:src/botbase.db");
+        try (Connection con = ds.getConnection();
              PreparedStatement stt = con.prepareStatement("UPDATE Users SET " + key + " = ? WHERE uid = ?")) {
 
             stt.setString(1, newVal);
@@ -53,7 +68,7 @@ public class UserDB implements Databaseable {
     public Entity get(String id) {
         UserEntity repository = new UserEntity();
 
-        try (Connection con = DriverManager.getConnection("jdbc:sqlite:src/botbase.db");
+        try (Connection con = ds.getConnection();
              PreparedStatement stt = con.prepareStatement("SELECT * FROM Users WHERE id = ?")) {
 
             stt.setString(1, id);
@@ -106,7 +121,7 @@ public class UserDB implements Databaseable {
     public Entity getByUid(String id) {
         UserEntity repository = null;
 
-        try (Connection con = DriverManager.getConnection("jdbc:sqlite:src/botbase.db");
+        try (Connection con = ds.getConnection();
              PreparedStatement stt = con.prepareStatement("SELECT * FROM Users WHERE uid = ?")) {
 
             stt.setString(1, id);
@@ -178,7 +193,7 @@ public class UserDB implements Databaseable {
     public void add(UserEntity repository) throws ApiException {
         if (!has(repository.getTgId())) {
             logger.info("Пытаемся добавить нового пользователя...");
-            try (Connection con = DriverManager.getConnection("jdbc:sqlite:src/botbase.db");
+            try (Connection con = ds.getConnection();
                  PreparedStatement stt = con.prepareStatement("INSERT INTO Users (tgName, firstName, lastName, id, language, uid, referral, state, wc, role, apiKey, secretKey, phrase, name, positions, plecho, variant, sum, proc, beerj, status, expiry, regVar, grp, getRew, invited, posOpened, isActiveRef, activeRefCount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")) {
 
                 stt.setString(1, repository.getTgName().trim());

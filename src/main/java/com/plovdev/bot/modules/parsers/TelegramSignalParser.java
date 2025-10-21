@@ -8,79 +8,62 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class TelegramSignalParser {
+    private static final Pattern SYMBOL_PATTERN = Pattern.compile("ℹ️\\s*(\\w+/?\\w+)");
+    private static final Pattern DIRECTION_PATTERN = Pattern.compile("(🟢\\s*LONG|🔴\\s*SHORT)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern TYPE_PATTERN = Pattern.compile(".(\uD83D\uDD31\\s*market|\uD83D\uDD31\\s*\\d+\\.\\d+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern TARGET_PATTERN = Pattern.compile("🎯\\s*(\\d+\\.\\d+)");
+    private static final Pattern STOP_LOSS_PATTERN = Pattern.compile("[⛔|⛔️]\\s*(\\d+\\.*\\d+)");
     public static Signal parse(String signalText) {
-        String symbol = "";
-        String direction = "";
-        List<String> types = new ArrayList<>();
-        List<BigDecimal> targets = new ArrayList<>();
-        String stopLoss = "0";
-
-
-        // Парсинг символа
-        Pattern symbolPattern = Pattern.compile("ℹ️\\s*(\\w+/?\\w+)");
-        Matcher symbolMatcher = symbolPattern.matcher(signalText);
-        if (symbolMatcher.find()) {
-            symbol = symbolMatcher.group(1);
+        if (!validate(signalText)) {
+            throw new IllegalArgumentException("Invalid signal format");
         }
-
-        // Парсинг направления (SHORT/LONG)
-        Pattern directionPattern = Pattern.compile("(🟢\\s*LONG|🔴\\s*SHORT)", Pattern.CASE_INSENSITIVE);
-        Matcher directionMatcher = directionPattern.matcher(signalText);
-        if (directionMatcher.find()) {
-            String dir = directionMatcher.group(1);
-            direction = dir.contains("LONG") ? "LONG" : "SHORT";
-        }
-
-        Pattern typePattern = Pattern.compile(".(\uD83D\uDD31\\s*market|\uD83D\uDD31\\s*\\d+\\.\\d+)", Pattern.CASE_INSENSITIVE);
-        Matcher typeMatcher = typePattern.matcher(signalText);
-        while (typeMatcher.find()) {
-            String tp = typeMatcher.group(1).substring(2).trim().toLowerCase();
-            types.add(tp);
-        }
-
-        // Парсинг целей (targets)
-        Pattern targetPattern = Pattern.compile("🎯\\s*(\\d+\\.\\d+)");
-        Matcher targetMatcher = targetPattern.matcher(signalText);
-        while (targetMatcher.find()) {
-            targets.add(new BigDecimal(targetMatcher.group(1)));
-        }
-
-        // Парсинг стоп-лосса
-        Pattern stopLossPattern = Pattern.compile("[⛔|⛔️]\\s*(\\d+\\.*\\d+)");
-        Matcher stopLossMatcher = stopLossPattern.matcher(signalText);
-        if (stopLossMatcher.find()) {
-            stopLoss = stopLossMatcher.group(1);
-        }
+        String symbol = parseString(signalText, SYMBOL_PATTERN);
+        String direction = parseDirection(signalText);
+        List<String> types = parseTypes(signalText);
+        List<BigDecimal> targets = parseTargets(signalText);
+        String stopLoss = parseString(signalText, STOP_LOSS_PATTERN);
         Collections.sort(targets);
-
-        System.err.println(stopLoss + " - stopLOOASS");
         return new Signal("tg", symbol.replace("/", ""), null, direction, types, stopLoss, targets, "tg", null);
+    }
+    private static String parseString(String signalText, Pattern pattern) {
+        Matcher matcher = pattern.matcher(signalText);
+        if (matcher.find()) {
+            return matcher.group(1);
+        }
+        return "";
+    }
+    private static String parseDirection(String signalText) {
+        Matcher matcher = DIRECTION_PATTERN.matcher(signalText);
+        if (matcher.find()) {
+            String dir = matcher.group(1);
+            return dir.contains("LONG") ? "LONG" : "SHORT";
+        }
+        return "";
+    }
+    private static List<String> parseTypes(String signalText) {
+        List<String> types = new ArrayList<>();
+        Matcher matcher = TYPE_PATTERN.matcher(signalText);
+        while (matcher.find()) {
+            types.add(matcher.group(1).substring(2).trim().toLowerCase());
+        }
+        return types;
+    }
+    private static List<BigDecimal> parseTargets(String signalText) {
+        List<BigDecimal> targets = new ArrayList<>();
+        Matcher matcher = TARGET_PATTERN.matcher(signalText);
+        while (matcher.find()) {
+            targets.add(new BigDecimal(matcher.group(1)));
+        }
+        return targets;
     }
 
     public static boolean validate(String signalText) {
-        boolean symbol;
-        boolean direction;
-        boolean stopLoss;
-
-
-        // Парсинг символа
-        Pattern symbolPattern = Pattern.compile("ℹ️\\s*(\\w+/?\\w+)");
-        Matcher symbolMatcher = symbolPattern.matcher(signalText);
-        symbol = symbolMatcher.find();
-
-        // Парсинг направления (SHORT/LONG)
-        Pattern directionPattern = Pattern.compile("(🟢\\s*LONG|🔴\\s*SHORT)", Pattern.CASE_INSENSITIVE);
-        Matcher directionMatcher = directionPattern.matcher(signalText);
-        direction = directionMatcher.find();
-
-        // Парсинг стоп-лосса
-        Pattern stopLossPattern = Pattern.compile("[⛔|⛔️]\\s*(\\d+.*\\d+)");
-        Matcher stopLossMatcher = stopLossPattern.matcher(signalText);
-        stopLoss = stopLossMatcher.find();
-
-        System.err.println(symbol + " - symbol");
-        System.err.println(direction + " - side");
-        System.err.println(stopLoss + " - stop");
-        return symbol && direction && stopLoss;
+        if (signalText == null || signalText.trim().isEmpty()) {
+            return false;
+        }
+        boolean symbolFound = SYMBOL_PATTERN.matcher(signalText).find();
+        boolean directionFound = DIRECTION_PATTERN.matcher(signalText).find();
+        boolean stopLossFound = STOP_LOSS_PATTERN.matcher(signalText).find();
+        return symbolFound && directionFound && stopLossFound;
     }
 }
