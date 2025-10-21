@@ -65,23 +65,33 @@ public class BitGetTakesSetuper {
             String orderId = inputOrder.getOrderId();
 
             if (tradeSide.equalsIgnoreCase("open")) {
-                Position position = service.getPositions(user).stream().filter(p -> p.getSymbol().equals(symbol) && p.getHoldSide().equalsIgnoreCase(direction)).toList().getFirst();
-                List<TakeProfitLevel> newTakes = BeerjUtils.reAdjustTakeProfits(position.getTotal(), tpLevels, info, service.getEntryPrice(symbol), direction);
-                List<Order> orderList = service.getOrders(user).stream().filter(o -> o.getSymbol().equals(symbol) && o.getTradeSide().equalsIgnoreCase("close")).toList();
-                for (int i = 0; i < newTakes.size(); i++) {
-                    Order o = orderList.get(i);
-                    TakeProfitLevel level = newTakes.get(i);
-                    Map<String, String> payload = new HashMap<>();
-                    System.out.println(o.getOrderId());
-                    payload.put("orderId", o.getOrderId());
-                    payload.put("symbol", symbol);
-                    payload.put("productType", "USDT-FUTURES");
-                    payload.put("newSize", level.getSize().toPlainString());
-                    payload.put("newPrice", o.getPrice().toPlainString());
-                    payload.put("newClientOid", "BITGET#" + o.getOrderId());
+                Position position = service.getPositions(user).stream().filter(p -> p.getSymbol().equals(symbol) && p.getHoldSide().equalsIgnoreCase(direction)).findFirst().orElse(null);
+                if (position == null) return;
 
-                    ids.set(i, service.modifyOrder(user, payload));
-                    tpLevels.set(i, level);
+                List<TakeProfitLevel> newTakes = BeerjUtils.reAdjustTakeProfits(position.getTotal(), tpLevels, info, service.getEntryPrice(symbol), direction);
+                List<Order> openOrders = service.getOrders(user).stream().filter(o -> o.getSymbol().equals(symbol) && o.getTradeSide().equalsIgnoreCase("close")).toList();
+
+                if (openOrders.size() != newTakes.size()) {
+                    logger.error("CRITICAL MISMATCH: Number of open TP orders ({}) does not match new TP levels ({}). Re-creating TP orders.", openOrders.size(), newTakes.size());
+                    service.cancelLimits(user, symbol, openOrders.stream().map(Order::getOrderId).toList());
+                    List<Map<String, String>> newOrdersPayload = placeTakes(position.getTotal(), newTakes, symbol, direction);
+                    ids.clear();
+                    ids.addAll(service.placeOrders(user, symbol, newOrdersPayload));
+                } else {
+                    for (int i = 0; i < newTakes.size(); i++) {
+                        Order o = openOrders.get(i);
+                        TakeProfitLevel level = newTakes.get(i);
+                        Map<String, String> payload = new HashMap<>();
+                        payload.put("orderId", o.getOrderId());
+                        payload.put("symbol", symbol);
+                        payload.put("productType", "USDT-FUTURES");
+                        payload.put("newSize", level.getSize().toPlainString());
+                        payload.put("newPrice", o.getPrice().toPlainString());
+                        payload.put("newClientOid", "BITGET#" + o.getOrderId());
+
+                        ids.set(i, service.modifyOrder(user, payload));
+                        tpLevels.set(i, level);
+                    }
                 }
             }
 

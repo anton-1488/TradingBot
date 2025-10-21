@@ -155,11 +155,14 @@ public class BitUnixTradeService implements TradeService {
         BitUnixWS ws = new BitUnixWS(user, this, symbol);
         if (types.contains("market")) {
             try {
-                CompletableFuture<Position> positionFuture = CompletableFuture.supplyAsync(() -> getPositions(user).stream().filter(p -> {
-                    System.out.println("Pos symbol: " + p.getSymbol());
-                    System.out.println("Pos side: " + p.getHoldSide());
-                    return p.getSymbol().equalsIgnoreCase(symbol);
-                }).toList().getFirst());
+                CompletableFuture<Position> positionFuture = CompletableFuture.supplyAsync(() -> {
+                    try {
+                        return fetchPositionWithRetry(user, symbol);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Failed to fetch position due to interruption", e);
+                    }
+                });
                 Position position = positionFuture.get();
 
                 CompletableFuture<Void> setupStop = CompletableFuture.supplyAsync(() -> {
@@ -198,6 +201,20 @@ public class BitUnixTradeService implements TradeService {
         logger.info("TOTALS: Order opened for {}ms({}s)", totalTimeMillis, totalTimeSecs);
 
         return OrderResult.ok("Position placed, userId: " + user.getTgId() + ", tgName: " + user.getTgName(), results.getFirst().id(), symbol);
+    }
+
+    private Position fetchPositionWithRetry(UserEntity user, String symbol) throws InterruptedException {
+        int retries = 3;
+        for (int i = 0; i < retries; i++) {
+            Optional<Position> position = getPositions(user).stream()
+                    .filter(p -> p.getSymbol().equalsIgnoreCase(symbol))
+                    .findFirst();
+            if (position.isPresent()) {
+                return position.get();
+            }
+            Thread.sleep(500); // Wait 500ms before retrying
+        }
+        throw new RuntimeException("Position not found after multiple retries for symbol: " + symbol);
     }
 
     private BigDecimal setSize(SymbolInfo symbolInfo, BigDecimal totalSize) {
