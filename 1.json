@@ -1,0 +1,47 @@
+{
+    "action": "snapshot",
+    "arg": {
+        "instType": "USDT-FUTURES",
+        "channel": "orders",
+        "instId": "default"
+    },
+    "data": [
+        {
+            "accBaseVolume": "0",
+            "cTime": "1760813747124",
+            "cancelReason": "",
+            "clientOid": "1363517170821791744",
+            "enterPointSource": "API",
+            "feeDetail": [
+                {
+                    "feeCoin": "USDT",
+                    "fee": "0.00000000"
+                }
+            ],
+            "force": "gtc",
+            "instId": "DOGEUSDT",
+            "leverage": "5",
+            "marginCoin": "USDT",
+            "marginMode": "isolated",
+            "notionalUsd": "47.50677",
+            "orderId": "1363517170796625920",
+            "orderType": "market",
+            "posMode": "hedge_mode",
+            "posSide": "long",
+            "presetStopLossExecutePrice": "",
+            "presetStopLossType": "",
+            "presetStopSurplusExecutePrice": "",
+            "presetStopSurplusType": "",
+            "price": "0",
+            "reduceOnly": "no",
+            "side": "buy",
+            "size": "251",
+            "status": "live",
+            "stpMode": "none",
+            "totalProfits": "0",
+            "tradeSide": "open",
+            "uTime": "1760813747124"
+        }
+    ],
+    "ts": 1760813747137
+}

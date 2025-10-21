@@ -1,0 +1,3148 @@
+package com.plovdev.bot.main;
+
+import com.plovdev.bot.bots.Button;
+import com.plovdev.bot.bots.ExpiryListener;
+import com.plovdev.bot.bots.LanguageManager;
+import com.plovdev.bot.bots.Utils;
+import com.plovdev.bot.modules.beerjes.BitGetTradeService;
+import com.plovdev.bot.modules.beerjes.TradeService;
+import com.plovdev.bot.modules.databases.BlanksDB;
+import com.plovdev.bot.modules.databases.ReferralDB;
+import com.plovdev.bot.modules.databases.UserDB;
+import com.plovdev.bot.modules.databases.UserEntity;
+import com.plovdev.bot.modules.messages.AdminComands;
+import com.plovdev.bot.modules.messages.Messager;
+import com.plovdev.bot.modules.messages.Pending;
+import com.plovdev.bot.modules.models.OrderResult;
+import com.plovdev.bot.modules.models.SymbolInfo;
+import com.plovdev.bot.modules.parsers.Signal;
+import com.plovdev.bot.modules.parsers.TelegramSignalParser;
+import com.plovdev.bot.modules.parsers.TradingViewSignalParser;
+import com.plovdev.bot.modules.parsers.notifies.SignalListener;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.telegram.telegrambots.bots.TelegramLongPollingBot;
+import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
+import org.telegram.telegrambots.meta.api.objects.Message;
+import org.telegram.telegrambots.meta.api.objects.Update;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+
+import java.math.BigDecimal;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.prefs.Preferences;
+
+public class Bot extends TelegramLongPollingBot {
+    private static final Logger log = LoggerFactory.getLogger(Bot.class);
+    private final Preferences prefs = Preferences.userRoot().node("TradingBot");
+
+    @Override
+    public String getBotToken() {
+        return Utils.getBotToken();
+    }
+
+    @Override
+    public String getBotUsername() {
+        return "TradingBot";
+    }
+
+    private final Messager messager = new Messager(this);
+    private final AdminComands comands = new AdminComands(this);
+    private final LanguageManager manager = new LanguageManager();
+    private final UserDB userDB = new UserDB();
+    private final ReferralDB referralDB = new ReferralDB();
+    private final DateTimeFormatter formatter = DateTimeFormatter.ofPattern("HH:mm");
+    private final BlanksDB blanksDB = new BlanksDB();
+    private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+
+
+    public Bot() {
+        messager.registerComands(); // добавляем команды для бота.
+        comands.registerComands();
+
+        SignalListener.addSignalListener(((signal) -> {
+            try {
+                // 1 раз загружаем данные, и у всех пользователей открываем по ним.
+                // Так, доступ к публичному endpoint не забанят, а private - там лимиты для каждого UID отдельно.
+                CompletableFuture<SymbolInfo> getBI = CompletableFuture.supplyAsync(() -> TestUtils.bitgetService.getSymbolInfo(TestUtils.bitgetTestUser, signal.getSymbol()));
+                CompletableFuture<BigDecimal> getBEP = CompletableFuture.supplyAsync(() -> TestUtils.bitgetService.getEntryPrice(signal.getSymbol()));
+
+                CompletableFuture<SymbolInfo> getUI = CompletableFuture.supplyAsync(() -> TestUtils.bitunixService.getSymbolInfo(TestUtils.bitunixUser, signal.getSymbol()));
+                CompletableFuture<BigDecimal> getUEP = CompletableFuture.supplyAsync(() -> TestUtils.bitunixService.getEntryPrice(signal.getSymbol()));
+
+                CompletableFuture.allOf(getBI, getUI, getBEP, getUEP).join();
+
+                SymbolInfo bInfo = getBI.get(); // BitGet
+                SymbolInfo uInfo = getUI.get(); // BitUnix
+                BigDecimal bep = getBEP.get(); // BitGet
+                BigDecimal uep = getUEP.get(); // BitUnix
+
+                log.info("First data getted: binfo: {}, uinfo: {}, bep: {}, uep: {}", bInfo, uInfo, bep, uep);
+
+                List<UserEntity> activeUsers = userDB.getAll().stream().filter(u -> "ACTIVE".equals(u.getStatus())).toList();
+                log.info("🚀 Executing signal for {} active users", activeUsers.size());
+
+                List<CompletableFuture<OrderResult>> futures = activeUsers.stream().map(user -> processUser(executor, user, signal, bInfo, uInfo, bep, uep)).toList();
+                CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new))
+                        .thenAccept(v -> log.info("✅ Signal execution completed for all users"))
+                        .exceptionally(e -> {
+                            log.error("❌ Signal execution failed: {}", e.getMessage());
+                            return null;
+                        });
+            } catch (Exception e) {
+                log.error("ER: ", e);
+            }
+        }));
+
+        ExpiryListener.addListener((id, lang) -> {
+            try {
+                execute(new SendMessage(id, manager.getText(lang, "expireOut")));
+            } catch (Exception e) {
+                log.error("Failed to send expiry notifications to user {}:", id, e);
+            }
+        });
+    }
+
+    private CompletableFuture<OrderResult> processUser(ExecutorService executor, UserEntity repository, Signal signal, SymbolInfo bsi, SymbolInfo usi, BigDecimal bep, BigDecimal uep) {
+        return CompletableFuture.supplyAsync(() -> {
+            OrderResult result = OrderResult.no();
+            try {
+                TradeService service = repository.getUserBeerj();
+                int all = service.getPositions(repository).size();
+                String positions = repository.getPositions();
+                if (positions.equals("all")) {
+                    if (service instanceof BitGetTradeService) {
+                        result = service.openOrder(signal, repository, bsi, bep);
+                    } else {
+                        //result = service.openOrder(signal, repository, usi, uep);
+                    }
+                    System.out.println(result);
+                    if (result.succes() && !repository.getReferral().equals("none")) {
+                        System.out.println("managing");
+                        manageReferral(repository);
+                    }
+                } else {
+                    log.info("Open order for user");
+                    if ((Integer.parseInt(repository.getPositions()) - all) > 0) {
+                        if (service instanceof BitGetTradeService) {
+                            log.info("Open bitget order");
+                            result = service.openOrder(signal, repository, bsi, bep);
+                        } else {
+                            //result = service.openOrder(signal, repository, usi, uep);
+                        }
+                        System.out.println(result);
+                        if (result.succes() && !repository.getReferral().equals("none")) {
+                            manageReferral(repository);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                log.error("Error process user signal: ", e);
+            }
+            return result;
+        }, executor);
+    }
+
+    private void manageReferral(UserEntity repository) {
+        int posOpened = repository.getPosOpened() + 1;
+        repository.setPosOpened(posOpened);
+        userDB.update("posOpened", String.valueOf(posOpened), repository.getTgId());
+        if (posOpened >= 50) {
+            repository.setActiveRef(true);
+            userDB.update("isActiveRef", "true", repository.getTgId());
+
+            UserEntity repo = (UserEntity) userDB.get(repository.getReferral());
+            int actives = repo.getActiveRefCount() + 1;
+            repo.setActiveRefCount(actives);
+            userDB.update("activeRefCount", String.valueOf(actives), repo.getTgId());
+
+            if (actives >= 10) {
+                SendMessage message = new SendMessage(repository.getReferral(), manager.getText(repo.getLanguage(), "referrDone"));
+                blanksDB.add(repo.getTgId(), repo.getUID(), repo.getTgName(), "waiting", "ref", repo.getBeerj());
+                Button button = new Button(manager.getText(repo.getLanguage(), "pendReferr"), "REFERRAL_PENDING:" + repository.getTgId());
+                button.setActionListener(((update, message1, from, chatId, text, repository1) -> {
+                    EditMessageText edit = new EditMessageText(manager.getText(((UserEntity) repository1).getLanguage(), "refPending"));
+                    edit.setMessageId(message1.getMessageId());
+                    execute(edit);
+
+                    userDB.getAll().stream()
+                            .filter(e -> e.getRole().equals("admin"))
+                            .forEach(repos -> {
+                                String header = "<b>Новая заявка на реферал!</b>\n\n";
+                                String tgId = "ID в телеграм: <b>" + repo.getTgId() + "</b>\n";
+                                String name = "Имя: " + repo.getTgName() + "\n";
+                                String uid = "UID на beerже: <b>" + repo.getUID() + "</b>";
+                                Pending pending = new Pending(repos.getTgId(), header + tgId + name + uid, repo.getTgId(), this, "none", "referrAccept", "referrReject");
+                                try {
+                                    execute(pending);
+                                } catch (TelegramApiException e) {
+                                    log.error("Ошибка отправки заявки: {}", e.getMessage());
+                                }
+                            });
+
+                }));
+                message.setReplyMarkup(new InlineKeyboardMarkup(List.of(List.of(button))));
+                try {
+                    execute(message);
+                    userDB.update("activeRefCount", "0", repo.getTgId());
+                    userDB.update("inited", "0", repo.getTgId());
+
+                    userDB.update("isActiveRef", "false", repository.getTgId());
+                    userDB.update("posOpened", "0", repository.getTgId());
+                } catch (TelegramApiException e) {
+                    log.error("Telegram ref error: ", e);
+                }
+            }
+        }
+        try {
+            referralDB.upadateByKey("positions", "0", repository.getReferral());
+            referralDB.upadateByKey("invited", "0", repository.getReferral());
+        } catch (Exception e) {
+            log.error("Произошла ошибка выпонения реферала: {}", e.getMessage());
+        }
+    }
+
+    @Override
+    public void onUpdateReceived(Update update) {
+        if (update.hasMessage()) {
+            messager.notifyBotComands(update); // уведомляем команд
+        } else if (update.hasChannelPost() && update.getChannelPost().hasText()) {
+            Message message = update.getChannelPost();
+            String chatId = message.getChatId().toString();
+            String text = message.getText();
+
+
+            if (chatId.equals(prefs.get("chanel-id", "-1002729649638"))) {
+                if (TelegramSignalParser.validate(text)) SignalListener.notifySignals(TelegramSignalParser.parse(text));
+                else System.err.println("false");
+            }
+            if (chatId.equals(prefs.get("tv-chanel-id", "-1002729649638"))) {
+                if (TradingViewSignalParser.validate(text)) {
+                    SignalListener.notifySignals(TradingViewSignalParser.parse(text));
+                }
+            }
+        } else if (update.hasCallbackQuery()) {
+            messager.notifyBotButtons(update); // уведомляем калбеки.
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.plovdev.bot.modules.beerjes;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.plovdev.bot.modules.beerjes.bitget.BitGetOrderOpener;
+import com.plovdev.bot.modules.beerjes.bitget.BitGetStopLossTrailer;
+import com.plovdev.bot.modules.beerjes.bitget.BitGetTakesSetuper;
+import com.plovdev.bot.modules.beerjes.monitoring.BitGetWS;
+import com.plovdev.bot.modules.beerjes.security.BitGetSecurity;
+import com.plovdev.bot.modules.beerjes.security.EncryptionService;
+import com.plovdev.bot.modules.beerjes.utils.BeerjUtils;
+import com.plovdev.bot.modules.databases.UserEntity;
+import com.plovdev.bot.modules.exceptions.ApiException;
+import com.plovdev.bot.modules.exceptions.InvalidParametresException;
+import com.plovdev.bot.modules.exceptions.NetworkException;
+import com.plovdev.bot.modules.logging.Colors;
+import com.plovdev.bot.modules.models.*;
+import com.plovdev.bot.modules.parsers.Signal;
+import com.plovdev.bot.modules.parsers.SignalCorrector;
+import okhttp3.*;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+import static com.plovdev.bot.modules.beerjes.utils.BitGetUtils.*;
+
+public class BitGetTradeService implements TradeService {
+    private final OkHttpClient client = new OkHttpClient.Builder()
+            .connectionPool(new ConnectionPool(10, 5, TimeUnit.MINUTES))
+            .callTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(5, TimeUnit.SECONDS)
+            .build();
+
+    private final Logger logger = LoggerFactory.getLogger("BitGetTradeService");
+    private final com.plovdev.bot.modules.logging.Logger custom = new com.plovdev.bot.modules.logging.Logger();
+    private final BitGetSecurity security;
+    private final SettingsService settings = new SettingsService();
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private String stopLossId = "";
+    private StopInProfitTrigger trigger = new StopInProfitTrigger();
+
+    TypeValueSwitcher<Boolean> isPositioned = new TypeValueSwitcher<>(false);
+
+    /**
+     * Констуктор класса.
+     * Инициализирует сервис, для работы с безопасностью.
+     *
+     * @param security сервис для работы с безопасностью, шифрованием, и тд.
+     */
+    public BitGetTradeService(BitGetSecurity security) {
+        this.security = security;
+    }
+
+
+    /**
+     * Метод, который открывает ордер, и возвращает результат.
+     *
+     * @param signal сигнал, который нужно открыть. Содержит всю информацию о сигнале
+     *               типа targets, stop-loss, tp, type(limit, mraket) и тд.
+     * @param user   Пользователь, у которого будет открываться сигнал.
+     * @return Результат открытия сигнала.
+     */
+    @Override
+    public OrderResult openOrder(Signal signal, UserEntity user, SymbolInfo symbolInfo, BigDecimal entryPrice) throws Exception {
+        printPart("OPEN ORDER");
+        SignalCorrector.correct(signal, BeerjUtils.BITGET);
+        custom.info(signal.toString());
+        System.out.println();
+        trigger = StopInProfitTrigger.load(user.getGroup());
+
+        String direction = signal.getDirection();
+        int effectiveLeverage = getEffectiveLeverage(symbolInfo.getMaxLever(), Integer.parseInt(user.getPlecho()));
+        BigDecimal leverage = BigDecimal.valueOf(effectiveLeverage);
+
+        long startTimeOpening = System.currentTimeMillis();
+        BitGetOrderOpener opener = new BitGetOrderOpener(signal, security, this);
+
+        String symbol = signal.getSymbol();
+
+        CompletableFuture<Void> marginModeChange = CompletableFuture.supplyAsync(() -> {
+            System.out.println("Change margin mode...");
+            setMarginMode(user, "isolated", symbol);
+            System.out.println("Margin mode changed");
+            return null;
+        });
+        CompletableFuture<OrderResult> changeLeverFuture = CompletableFuture.supplyAsync(() -> changeLeverge(user, symbol, direction.toLowerCase(), effectiveLeverage));
+        CompletableFuture<OrderResult> validateOpen = CompletableFuture.supplyAsync(() -> BeerjUtils.valdateOpen(user, signal));
+        CompletableFuture<BigDecimal> getPs = CompletableFuture.supplyAsync(() -> BeerjUtils.getPosSize(user, signal, this, entryPrice));
+
+        CompletableFuture.allOf(changeLeverFuture, marginModeChange, validateOpen, getPs).join();
+
+        logger.info("Configurated environment.");
+        //----------------------------------------------------------\\
+        logger.info("Validating user. Id: {}, name: {}", user.getTgId(), user.getTgName());
+        OrderResult canNext = validateOpen.get();
+        if (!canNext.succes()) {
+            logger.warn("This user cannot next open order. Has open position for symbol: {}", symbol);
+            return canNext;
+        }
+        logger.info("User can open order!\n\n");
+
+        BigDecimal positionSize = getPs.get().multiply(leverage);
+
+        List<String> types = signal.getTypeOreder();
+        BigDecimal oneOrderSize = (new BigDecimal("100.0").divide(BigDecimal.valueOf(types.size()), 5, RoundingMode.HALF_EVEN)).divide(new BigDecimal("100.0"), symbolInfo.getPricePlace(), RoundingMode.HALF_EVEN);
+        BigDecimal totalSize = setSize(symbolInfo, positionSize.multiply(oneOrderSize).setScale(symbolInfo.getVolumePlace(), RoundingMode.HALF_EVEN));
+        custom.warn("Total size before scaling: {}", totalSize);
+
+
+        logger.info("Getting variable values: positionSize: {}, leverage: {}, direction: {}, types size: {}, types: {}", positionSize, leverage, direction, types.size(), types);
+        logger.info("One order size: {}, totalSize: {}\n\n", oneOrderSize, totalSize);
+
+        logger.info("Try change leverage. New lever: {}", effectiveLeverage);
+
+        OrderResult leverResult = changeLeverFuture.get();
+        if (!leverResult.succes()) {
+            logger.info("Leverage not changed successfuly");
+            marginModeChange.get();
+            return leverResult;
+        }
+        logger.info("Leverage changed.\n\n");
+
+        logger.info("Put orders payload.");
+        List<Map<String, String>> ordersPayload = new ArrayList<>();
+        if (types.contains("market")) {
+            ordersPayload.add(opener.placeOrder(user, symbol, direction, totalSize, "market", null, effectiveLeverage));
+            logger.info("Added market order to payload.");
+        }
+
+        if (types.size() > 1 || !types.contains("market")) {
+            BigDecimal totalMargin = BigDecimal.ZERO;
+            for (int i = types.contains("market") ? 1 : 0; i < types.size(); i++) {
+                ordersPayload.add(opener.placeOrder(user, symbol, direction, totalSize, "limit", new BigDecimal(types.get(i)).setScale(symbolInfo.getPricePlace(), RoundingMode.HALF_EVEN), effectiveLeverage));
+                logger.info("Added limit order to payload.");
+            }
+        }
+
+        logger.info("Batch orders payload formed: {}", ordersPayload);
+        List<OrderResult> results = placeOrders(user, symbol, ordersPayload);
+        for (OrderResult result : results) {
+            if (!result.succes()) {
+                return result;
+            }
+        }
+
+        BitGetWS ws = new BitGetWS(user, security, this);
+        if (types.contains("market")) {
+            try (ExecutorService placeExecutor = Executors.newSingleThreadExecutor()) {
+                CompletableFuture<Void> setupTakes = CompletableFuture.supplyAsync(() -> {
+                    try {
+                        Position position = getPositions(user).stream().filter(p -> p.getSymbol().equals(symbol) && p.getHoldSide().equalsIgnoreCase(direction)).toList().getFirst();
+                        placeStopLoss(user, position, signal.getStopLoss(), symbolInfo);
+                        ws.setStopId(stopLossId);
+                        custom.info("Setuped sl: {}", stopLossId);
+                        isPositioned.setT(true);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                    return null;
+                });
+                CompletableFuture.allOf(setupTakes).join();
+
+                placeExecutor.execute(() -> {
+                    setupTP(signal, user, totalSize, new BigDecimal(signal.getStopLoss()), ws, totalSize, symbolInfo);
+                    custom.info("Setuped tp");
+                    isPositioned.setT(true);
+                });
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        long endTimeOpening = System.currentTimeMillis();
+        long totalTimeMillis = endTimeOpening - startTimeOpening;
+        long totalTimeSecs = (endTimeOpening - startTimeOpening) / 1000;
+        logger.info("TOTALS: Order opened for {}ms({}s)", totalTimeMillis, totalTimeSecs);
+
+        logger.info("Starting position monitor...");
+        startPositionMonitor(user, symbol, signal, totalSize, ws, totalSize, symbolInfo);
+        logger.info("Position monitor started.");
+
+        return OrderResult.ok("Position placed, userId: " + user.getTgId() + ", tgName: " + user.getTgName(), results.getFirst().id(), symbol);
+    }
+
+    private BigDecimal setSize(SymbolInfo symbolInfo, BigDecimal totalSize) {
+        BigDecimal sizeMultiplier = symbolInfo.getSizeMultiplier();
+        if (!BeerjUtils.isMultiple(totalSize, sizeMultiplier)) {
+            totalSize = totalSize.divide(sizeMultiplier, symbolInfo.getVolumePlace(), RoundingMode.HALF_EVEN).multiply(sizeMultiplier);
+            if (totalSize.compareTo(symbolInfo.getMinTradeNum()) < 0) {
+                totalSize = symbolInfo.getMinTradeNum();
+            }
+        }
+        return totalSize;
+    }
+
+    @Override
+    public OrderResult closeOrder(UserEntity user, Order order) throws ApiException {
+        try {
+            long timestamp = System.currentTimeMillis();
+            String api = security.decrypt(user.getApiKey());
+            String secret = security.decrypt(user.getSecretKey());
+            String phrase = security.decrypt(user.getPhrase());
+            String path = "/api/v2/mix/order/cancel-order";
+            String method = "POST";
+
+            String id = order.getOrderId();
+            String symbol = order.getSymbol();
+            System.out.println(id + " - ID");
+            System.out.println(symbol + " - SYMBOL");
+
+            Map<String, String> orderMap = new HashMap<>();
+            orderMap.put("orderId", id.trim());
+            orderMap.put("symbol", symbol);
+            orderMap.put("productType", "usdt-futures");
+            orderMap.put("marginCoin", "USDT");
+
+            String body = objectMapper.writeValueAsString(orderMap);
+
+            System.err.println(body);
+            String sign = security.generateSignature(timestamp + method + path + body, secret);
+            // 2. Формируем запрос
+            Request request = new Request.Builder()
+                    .url(BITGET_API_BASE_URL + path)
+                    .post(RequestBody.create(body, MediaType.get("application/json")))
+                    .addHeader("ACCESS-KEY", api)
+                    .addHeader("ACCESS-SIGN", sign)
+                    .addHeader("ACCESS-TIMESTAMP", String.valueOf(timestamp))
+                    .addHeader("ACCESS-PASSPHRASE", phrase)
+                    .addHeader("Content-Type", "application/json")
+                    .build();
+
+            // 3. Отправляем запрос
+            custom.info("Отправляем запрос");
+
+            try (Response response = client.newCall(request).execute()) {
+                String responseBody = Objects.requireNonNull(response.body()).string();
+                custom.warn(responseBody);
+                if (validateJsonResopnse(responseBody)) {
+                    return OrderResult.ok("ордер отменен", id, symbol);
+                } else {
+                    return OrderResult.error("no success order canceling", id, symbol);
+                }
+            }
+        } catch (IOException e) {
+            logger.error("Произошла ошибка отправки post запроса в BitGet: {}", e.getMessage());
+            throw new ApiException(e.getMessage());
+        } catch (Exception e) {
+            logger.error("Произошла критичиская ошибка отправки post запроса: ", e);
+            throw new ApiException(e.getMessage());
+        }
+    }
+
+    @Override
+    public OrderResult closePosition(UserEntity user, Position position) throws ApiException {
+        try {
+            long timestamp = System.currentTimeMillis();
+            String api = security.decrypt(user.getApiKey());
+            String secret = security.decrypt(user.getSecretKey());
+            String phrase = security.decrypt(user.getPhrase());
+            String path = "/api/v2/mix/order/close-positions";
+            String method = "POST";
+
+            String pair = position.getSymbol();
+            String holdSide = position.getHoldSide();
+
+            Map<String, String> orderMap = new HashMap<>();
+            orderMap.put("symbol", pair);
+            orderMap.put("productType", "USDT-FUTURES");
+            orderMap.put("holdSide", holdSide);
+
+            String body = objectMapper.writeValueAsString(orderMap);
+
+            System.err.println(body);
+            String sign = security.generateSignature(timestamp + method + path + body, secret);
+            // 2. Формируем запрос
+            Request request = new Request.Builder()
+                    .url(BITGET_API_BASE_URL + path)
+                    .post(RequestBody.create(body, MediaType.get("application/json")))
+                    .addHeader("ACCESS-KEY", api)
+                    .addHeader("ACCESS-SIGN", sign)
+                    .addHeader("ACCESS-TIMESTAMP", String.valueOf(timestamp))
+                    .addHeader("ACCESS-PASSPHRASE", phrase)
+                    .addHeader("Content-Type", "application/json")
+                    .build();
+
+            // 3. Отправляем запрос
+            custom.info("Отправляем запрос");
+
+            try (Response response = client.newCall(request).execute()) {
+                String responseBody = Objects.requireNonNull(response.body()).string();
+                custom.warn(responseBody);
+                if (validateJsonResopnse(responseBody)) {
+                    return OrderResult.ok("Позиция закрыта", "none", pair);
+                } else {
+                    return OrderResult.error("no success position closing", "none", pair);
+                }
+            }
+        } catch (IOException e) {
+            logger.error("Произошла ошибка закрытия позиции в BitGet: {}", e.getMessage());
+            throw new ApiException(e.getMessage());
+        } catch (Exception e) {
+            logger.error("Произошла критичиская ошибка закрытия позиции: ", e);
+            throw new ApiException(e.getMessage());
+        }
+    }
+
+    public void printPart(String word, Object... objects) {
+        String part = "-".repeat(45);
+        word = word.trim().toUpperCase();
+
+        String str = part + word + part;
+        custom.blue(str, objects);
+    }
+
+    /**
+     * Метод для расчета размера позиции в USDT.
+     *
+     * @param user       пользователь.
+     * @param entryPrice цена.
+     * @param stopLoss   стоп-лосс.
+     * @return размер позиции в USDT.
+     */
+    @Override
+    public BigDecimal calculatePositionSize(UserEntity user, BigDecimal entryPrice, BigDecimal stopLoss, String positionSide) throws NetworkException {
+        BigDecimal totalSize;
+        custom.log("Params: price: {}, stop-loss: {}", "[INFO]", Colors.Blue.toString(), entryPrice, stopLoss);
+        if (entryPrice.compareTo(BigDecimal.ZERO) <= 0 || stopLoss.compareTo(BigDecimal.ZERO) <= 0)
+            throw new InvalidParametresException("Цена входа или стоп-лосс выставленны неверно! User ID: " + user.getTgId() + ". Username: " + user.getTgName());
+
+        BigDecimal stopLosssDistantionPercent;
+        if (positionSide.equals("LONG")) {
+            logger.info("Calcing stop loss distance for long");
+            // Для лонга: (entry - stopLoss) / entry
+            stopLosssDistantionPercent = (entryPrice.subtract(stopLoss))
+                    .divide(entryPrice, 10, RoundingMode.HALF_UP).abs();
+        } else {
+            // Для шорта: (stopLoss - entry) / entry
+            stopLosssDistantionPercent = (stopLoss.subtract(entryPrice))
+                    .divide(entryPrice, 10, RoundingMode.HALF_UP).abs();
+            logger.info("Calcing stop loss distance for short");
+        }
+        logger.info("StopLoss distance percent: {}", stopLosssDistantionPercent);
+
+        String varinat = user.getVariant();
+        logger.info("Variant: {}", varinat);
+
+        if (varinat.equals("proc")) {
+            BigDecimal balance = getBalance(user);
+            logger.info("Balance getted: {}", balance);
+
+            BigDecimal percents = new BigDecimal(user.getProc());
+            if (percents.compareTo(BigDecimal.ZERO) <= 0) {
+                throw new InvalidParametresException("Процент пользователя меньше или равен 0. User ID: \"+ user.getTgId() + \". Username: \" + user.getTgName()-------------- Percent: " + percents);
+            }
+
+            BigDecimal riskAmount = BeerjUtils.getPercent(percents, balance);
+            System.out.println(entryPrice.doubleValue());
+            custom.error(riskAmount.doubleValue() + " - risk");
+            BigDecimal size = riskAmount.divide(stopLosssDistantionPercent, 10, RoundingMode.HALF_UP);
+            custom.error(size.doubleValue() + " - size");
+
+            custom.log("Пользователь ID: {}, usrname: {}", "[INFO]", Colors.Blue.toString(), user.getTgId(), user.getTgName());
+            if (size.compareTo(BigDecimal.TEN) < 0) {
+                throw new IllegalArgumentException("size имеет слишком маленькое значение.");
+            }
+
+            custom.info("Расчёт размера позиции (риск %):");
+            custom.info("Баланс: {} USDT", balance);
+            custom.info("Риск: {}% → {} USDT", percents, riskAmount);
+            custom.info("Расстояние до стопа: {}%", stopLosssDistantionPercent.multiply(new BigDecimal("100")).toString());
+            custom.info("Размер позиции: {} USDT", size);
+
+            totalSize = size;
+        } else {
+            BigDecimal sum = new BigDecimal(user.getSum());
+            custom.info("Расчёт размера позиции (фиксираванная сумма):");
+            custom.info("Размер позиции: {} USDT", sum);
+            custom.info("цена входа: {}", entryPrice.toPlainString());
+
+            if (sum.compareTo(BigDecimal.TEN) < 0) {
+                throw new InvalidParametresException("У пользователя с id: " + user.getTgId() + ", name: " + user.getTgName() + " слишком малая сумма, хм.");
+            } else {
+                totalSize = sum.subtract(new BigDecimal("0.5"));
+                ;
+            }
+        }
+        return totalSize.divide(entryPrice, 10, RoundingMode.HALF_EVEN);
+    }
+
+    /**
+     * Получает минимальный размер ордера для сделки.
+     *
+     * @param user пользователь с ключами от биржи. Если его не сделать, то биржа будет блокировать мои запросы, поэтому это критически важно!!!
+     * @param pair пара.
+     * @return размер сделки.
+     */
+    @Override
+    public BigDecimal getLotSize(UserEntity user, String pair) throws NetworkException {
+        JSONArray array = getResponseArray(user, PAIR_LEVERAGE_ENDPOINT_GET + PRODUCT_TYPE + SYMBOL + pair);
+        if (array != null) {
+            for (int i = 0; i < array.length(); i++) {
+                JSONObject tradeNum = array.getJSONObject(i);
+                if (tradeNum.has("minTradeNum") && !tradeNum.isNull("minTradeNum")) {
+                    return new BigDecimal(tradeNum.getString("minTradeNum"));
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Возвращает лучшее плечо из ползовательского ввода, и биржевого.
+     *
+     * @return плечо.
+     */
+    @Override
+    public int getEffectiveLeverage(int max, int user) {
+        return Math.min(max, user);
+    }
+
+    @Override
+    public SymbolInfo getSymbolInfo(UserEntity user, String symbol) {
+        SymbolInfo info = new SymbolInfo();
+        try {
+            JSONArray array = getResponseArray(user, PAIR_LEVERAGE_ENDPOINT_GET + PRODUCT_TYPE + SYMBOL + symbol);
+            if (array != null) {
+                JSONObject symbolInfo = array.getJSONObject(0);
+                info.setSymbol(symbol);
+                info.setBaseCoin(symbolInfo.getString("baseCoin"));
+                info.setPricePlace(Integer.parseInt(symbolInfo.getString("pricePlace")));
+                info.setVolumePlace(Integer.parseInt(symbolInfo.getString("volumePlace")));
+                info.setMinTradeNum(new BigDecimal(symbolInfo.getString("minTradeNum")));
+                info.setMaxLever(Integer.parseInt(symbolInfo.getString("maxLever")));
+                info.setSizeMultiplier(new BigDecimal(symbolInfo.getString("sizeMultiplier")));
+            }
+        } catch (Exception e) {
+            logger.error("Symbol info error: ", e);
+        }
+        return info;
+    }
+
+    private JSONArray getResponseArray(UserEntity user, String end) throws NetworkException {
+        printPart("get response array");
+        try (Response response = sendToBitGet(security.decrypt(user.getApiKey()), security.decrypt(user.getSecretKey()), security.decrypt(user.getPhrase()), end)) {
+            String responseBody = Objects.requireNonNull(response.body()).string();
+            System.out.println("RESPONSE BODY" + responseBody);
+            boolean success = response.isSuccessful() && validateJsonResopnse(responseBody);
+            logger.info("Is succes? {}", success);
+            if (success) {
+                JSONObject object = new JSONObject(responseBody);
+                if (object.has("data") && !object.isNull("data")) {
+                    return object.getJSONArray("data");
+                }
+            } else {
+                logger.warn("https error; CODE: {}, BODY: {}", response.code(), responseBody);
+            }
+        } catch (IOException ex) {
+            custom.warn("Ошибка чтения с биржи:  {}", ex.getMessage());
+            throw new NetworkException(ex.getMessage());
+        } catch (Exception e) {
+            logger.error("Ошибка: ", e);
+            throw new ApiException(e.getMessage());
+        }
+        return null;
+    }
+
+    private JSONArray getResponseArray(String ary, UserEntity user, String end) throws NetworkException {
+        try (Response response = sendToBitGet(security.decrypt(user.getApiKey()), security.decrypt(user.getSecretKey()), security.decrypt(user.getPhrase()), end)) {
+            String responseBody = Objects.requireNonNull(response.body()).string();
+            System.out.println(responseBody);
+            boolean success = response.isSuccessful() && validateJsonResopnse(responseBody);
+            if (success) {
+                JSONObject object = new JSONObject(responseBody);
+                if (object.has("data") && !object.isNull("data")) {
+                    JSONObject data = object.getJSONObject("data");
+                    if (data.has(ary) && !data.isNull(ary)) {
+                        return data.getJSONArray(ary);
+                    }
+                }
+            } else {
+                logger.warn("https error; CODE: {}, BODY: {}", response.code(), responseBody);
+            }
+        } catch (IOException ex) {
+            custom.warn("Ошибка чтения с биржи:  {}", ex.getMessage());
+            throw new NetworkException(ex.getMessage());
+        } catch (Exception e) {
+            logger.error("Ошибка: ", e);
+            throw new ApiException(e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Валидируем АПИ ключи.
+     *
+     * @param entity пользователь с ключами от биржи. Если его не сделать, то биржа будет блокировать мои запросы, поэтому это критически важно!!!
+     * @return true если ключи валидны, false если нет.
+     */
+    @Override
+    public boolean checkApiKeys(UserEntity entity) throws NetworkException {
+        custom.info("Keys: ", security.decrypt(entity.getApiKey()), security.decrypt(entity.getSecretKey()), security.decrypt(entity.getPhrase()));
+        try (Response response = sendToBitGet(security.decrypt(entity.getApiKey()), security.decrypt(entity.getSecretKey()), security.decrypt(entity.getPhrase()), TEST_ACCOUNT_ENDPOINT_CHECK + PRODUCT_TYPE)) {
+            String responseBody = Objects.requireNonNull(Objects.requireNonNull(response).body()).string();
+
+            if (!response.isSuccessful()) {
+                logger.error("Ошибка ответа биржи: {} - {}", response.code(), responseBody);
+            }
+
+            boolean success = response.isSuccessful() && validateJsonResopnse(responseBody);
+            if (success) custom.info("Ключи подтверждены!");
+            else custom.warn("Ключи не подтверждены...");
+
+            return success; // Bitget возвращает "00000" при успехе
+        } catch (IOException ex) {
+            logger.warn("Ошибка чтения ключей биржи: {}", ex.getMessage());
+            throw new NetworkException(ex.getMessage());
+        }
+    }
+
+    public boolean validateJsonResopnse(String json) {
+        printPart("validate response");
+        logger.info("valiate resp...");
+        JSONObject object = new JSONObject(json);
+        if (object.has("code") && !object.isNull("code")) {
+            return object.getString("code").equals("00000");
+        }
+        logger.info("returning false...");
+        return false;
+    }
+
+    /**
+     * Получает баланс пользователя.
+     *
+     * @param user пользователь с ключами от биржи. Если его не сделать, то биржа будет блокировать мои запросы, поэтому это критически важно!!! ктому же у этого пользователя мы и проверяем баланс!
+     * @return баланс пользователя.
+     */
+    @Override
+    public BigDecimal getBalance(UserEntity user) throws NetworkException, ApiException {
+        JSONArray array = getResponseArray(user, TEST_ACCOUNT_ENDPOINT_CHECK + PRODUCT_TYPE);
+        if (array != null) {
+            for (int i = 0; i < array.length(); i++) {
+                JSONObject available = array.getJSONObject(i);
+                if (available.has("available") && !available.isNull("available")) {
+                    return new BigDecimal(available.getString("available"));
+                }
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public EncryptionService getSecurityService() {
+        return security;
+    }
+
+    private Response sendToBitGet(String api, String secret, String phrase, String path) {
+        logger.info("Генерируем подпись (HMAC)");
+        long timestamp = System.currentTimeMillis();
+        String method = "GET";
+
+        String sign = security.generateSignature(timestamp + method + path, secret);
+        // 2. Формируем запрос
+
+        logger.info("Формируем запрос");
+
+        Request request = new Request.Builder()
+                .url(BITGET_API_BASE_URL + path)
+                .addHeader("ACCESS-KEY", api)
+                .addHeader("ACCESS-SIGN", sign)
+                .addHeader("ACCESS-TIMESTAMP", String.valueOf(timestamp))
+                .addHeader("ACCESS-PASSPHRASE", phrase)
+                .addHeader("Content-Type", "application/json")
+                .build();
+
+        // 3. Отправляем запрос
+        custom.info("Отправляем запрос");
+
+        try {
+            return client.newCall(request).execute();
+        } catch (IOException e) {
+            logger.error("Произошла ошибка отправки запроса в BitGet: {}", e.getMessage());
+            throw new ApiException(e.getMessage());
+        } catch (Exception e) {
+            logger.error("Произошла критичиская ошибка отправки запроса: ", e);
+            throw new ApiException(e.getMessage());
+        }
+    }
+
+    @Override
+    public BigDecimal getEntryPrice(String pair) {
+        Request request = new Request.Builder()
+                .url(BITGET_API_BASE_URL + "/api/v2/mix/market/symbol-price?productType=usdt-futures&symbol=" + pair)
+                .build();
+
+        try (Response response = client.newCall(request).execute()) {
+            String body = Objects.requireNonNull(response.body()).string();
+            JSONObject object = new JSONObject(body);
+            if (object.has("data") && !object.isNull("data")) {
+                JSONArray data = object.getJSONArray("data");
+                for (int i = 0; i < data.length(); i++) {
+                    JSONObject price = data.getJSONObject(i);
+                    if (price.has("price") && !price.isNull("price")) return new BigDecimal(price.getString("price"));
+                }
+            }
+
+        } catch (IOException e) {
+            logger.error("Произошла ошибка получения цены: {}", e.getMessage());
+        } catch (Exception e) {
+            logger.error("Произошла критичиская ошибка полуяения цены: ", e);
+        }
+        return new BigDecimal("0.0");
+    }
+
+    /**
+     * Метод, который возвращает сервис безопасности.
+     *
+     * @return сервис безопаснисти BitGet.
+     */
+    public BitGetSecurity getSecurity() {
+        return security;
+    }
+
+    @Override
+    public List<OrderResult> cancelLimits(UserEntity user, String pair, List<String> ids) {
+        logger.info("Order id to cancel: {}", ids);
+        List<OrderResult> results = new ArrayList<>();
+        try {
+            String api = security.decrypt(user.getApiKey());
+            String secret = security.decrypt(user.getSecretKey());
+            String phrase = security.decrypt(user.getPhrase());
+            String timestamp = String.valueOf(System.currentTimeMillis());
+            String method = "POST";
+
+            String path = "/api/v2/mix/order/batch-cancel-orders";
+
+            List<Map<String, String>> orderList = new ArrayList<>();
+            for (String id : ids) {
+                Map<String, String> orderMap = new HashMap<>();
+                orderMap.put("orderId", id.trim()); // Каждый orderId в отдельном объекте
+                orderList.add(orderMap);
+            }
+
+            Map<String, Object> omap = new HashMap<>();
+            omap.put("symbol", pair);
+            omap.put("productType", "usdt-futures");
+            omap.put("marginCoin", "USDT");
+            omap.put("orderList", orderList);
+
+            String body = objectMapper.writeValueAsString(omap);
+            System.err.println(body);
+            String sign = security.generateSignature(timestamp + method + path + body, secret);
+
+            // 2. Формируем запрос
+            Request request = new Request.Builder()
+                    .url(BITGET_API_BASE_URL + path)
+                    .post(RequestBody.create(body, MediaType.get("application/json")))
+                    .addHeader("ACCESS-KEY", api)
+                    .addHeader("ACCESS-SIGN", sign)
+                    .addHeader("ACCESS-PASSPHRASE", phrase)
+                    .addHeader("ACCESS-TIMESTAMP", timestamp)
+                    .addHeader("locale", "en-US")
+                    .addHeader("Content-Type", "application/json")
+                    .build();
+
+            // 3. Отправляем запрос
+            custom.info("Отправляем запрос");
+
+            try (Response response = client.newCall(request).execute()) {
+                String responseBody = Objects.requireNonNull(response.body()).string();
+                custom.warn(responseBody);
+                if (validateJsonResopnse(responseBody)) {
+                    //TODO сделать id ордера(достать из ответа)
+                    results.add(OrderResult.ok("ордер отменен", null, pair));
+                } else {
+                    results.add(OrderResult.error("no success orders canceling", "123", pair));
+                }
+            }
+        } catch (IOException e) {
+            logger.error("Произошла ошибка отмены ордеров в BitGet: {}", e.getMessage());
+            throw new ApiException(e.getMessage());
+        } catch (Exception e) {
+            logger.error("Произошла критичиская ошибка отмены ордеров: ", e);
+            throw new ApiException(e.getMessage());
+        }
+        return results;
+    }
+
+
+    @Override
+    public List<Order> getOrders(UserEntity user) {
+        String api = security.decrypt(user.getApiKey());
+        String secret = security.decrypt(user.getSecretKey());
+        String phrase = security.decrypt(user.getPhrase());
+        String end = "/api/v2/mix/order/orders-pending?productType=usdt-futures";
+        List<Order> orders = new ArrayList<>();
+
+        try {
+            JSONArray array = getResponseArray("entrustedList", user, end);
+            if (array != null) {
+                for (int i = 0; i < array.length(); i++) {
+                    JSONObject object = array.getJSONObject(i);
+                    orders.add(new Order(
+                            object.getString("symbol").toUpperCase(),
+                            new BigDecimal(object.getString("size")),
+                            object.getString("orderId"),
+                            object.getString("clientOid"),
+                            null,
+                            object.getString("fee"),
+                            new BigDecimal(object.getString("price")),
+                            object.getString("status").isEmpty() ? "live" : object.getString("status"),
+                            object.getString("side"),
+                            null,
+                            object.getString("totalProfits"),
+                            object.getString("posSide"),
+                            object.getString("marginCoin"),
+                            null,
+                            new BigDecimal(object.getString("presetStopLossPrice").isEmpty() ? "0.0" : object.getString("presetStopLossPrice")),
+                            null,
+                            object.getString("orderType"),
+                            object.getInt("leverage"),
+                            object.getString("marginMode"),
+                            false,
+                            object.getString("tradeSide"),
+                            null,
+                            object.getString("orderSource"),
+                            object.getString("cTime"),
+                            object.getString("uTime")
+                    ));
+                }
+            }
+        } catch (NetworkException e) {
+            logger.error("Error:", e);
+        }
+        return orders;
+    }
+
+
+    @Override
+    public List<Position> getPositions(UserEntity user) {
+        String api = security.decrypt(user.getApiKey());
+        String secret = security.decrypt(user.getSecretKey());
+        String phrase = security.decrypt(user.getPhrase());
+        List<Position> orders = new ArrayList<>();
+
+        try {
+            JSONArray array = getResponseArray(user, GET_POSITIONS_ENDPOINT);
+            if (array != null) {
+                for (int i = 0; i < array.length(); i++) {
+                    JSONObject object = array.getJSONObject(i);
+                    orders.add(new Position(
+                            null,
+                            object.getString("marginCoin"),
+                            object.getString("symbol"),
+                            object.getString("holdSide"),
+                            new BigDecimal(object.getString("openDelegateSize")),
+                            new BigDecimal(object.getString("available")),
+                            new BigDecimal(object.getString("locked")),
+                            new BigDecimal(object.getString("total")),
+                            object.getInt("leverage"),
+                            new BigDecimal(object.getString("unrealizedPL")),
+                            new BigDecimal(object.getString("liquidationPrice")),
+                            new BigDecimal(object.getString("keepMarginRate")),
+                            new BigDecimal(object.getString("markPrice")),
+                            object.getString("cTime"),
+                            object.getString("uTime"),
+                            new BigDecimal(object.optString("openPriceAvg", "0.0")),
+                            false
+                    ));
+                }
+            }
+        } catch (NetworkException e) {
+            logger.error("Error:", e);
+        }
+        return orders;
+    }
+
+    public void setupTP(Signal signal, UserEntity user, BigDecimal positionSize, BigDecimal stopLoss, BitGetWS ws, BigDecimal margin, SymbolInfo symbolInfo) {
+        BitGetStopLossTrailer trailer = new BitGetStopLossTrailer(this, trigger);
+        BitGetTakesSetuper setuper = new BitGetTakesSetuper(trigger, this, trailer);
+        String symbol = signal.getSymbol();
+        String direction = signal.getDirection();
+        List<TakeProfitLevel> tpLevels;
+        try {
+            List<BigDecimal> tpRatios = settings.getTPRationsByGroup(user.getGroup()); // например, [30,30,20,10,10]
+            List<BigDecimal> takeProfits = signal.getTargets(); // Target 1, 2...
+            tpLevels = BeerjUtils.adjustTakeProfits(signal, positionSize, tpRatios, getEntryPrice(symbol), symbolInfo);
+            if (tpLevels.size()-1 <= trigger.getTakeToTrailNumber()) {
+                trigger.setTakeToTrailNumber(Math.max(tpLevels.size()-2, 0));
+            }
+
+            logger.info("Tp level before placing:");
+            tpLevels.forEach(l -> logger.info("Level: {}", l));
+
+            System.out.println("Setuping tp... stop loss id: " + stopLossId);
+            setuper.manageTakesInMonitor(ws, symbol, user, setuper.placeTakes(positionSize, tpLevels, symbol, direction), stopLossId, tpLevels, symbolInfo, positionSize, direction);
+        } catch (Exception e) {
+            logger.error("Critical error in setupTP for user {}: {}", user.getTgId(), e.getMessage(), e);
+        }
+    }
+
+    public List<OrderResult> placeOrders(UserEntity user, String pair, List<Map<String, String>> orders) {
+        List<OrderResult> results = new ArrayList<>();
+        try {
+            Map<String, Object> data = new HashMap<>();
+            data.put("symbol", pair);
+            data.put("productType", "usdt-futures");
+            data.put("marginMode", "isolated");
+            data.put("marginCoin", "USDT");
+            data.put("orderList", orders);
+
+            String response = postToBitGet("/api/v2/mix/order/batch-place-order", user, objectMapper.writeValueAsString(data));
+            custom.warn("response: {}", response);
+
+            JsonObject responseObject = new Gson().fromJson(response, JsonObject.class);
+            JsonObject dataObject = responseObject.getAsJsonObject("data");
+            JsonArray successList = dataObject.getAsJsonArray("successList");
+            successList.forEach(el -> {
+                JsonObject item = el.getAsJsonObject();
+                if (item.has("orderId"))
+                    results.add(OrderResult.ok("Orders placed!", item.get("orderId").getAsString(), pair));
+            });
+            JsonArray failureList = dataObject.getAsJsonArray("failureList");
+            failureList.forEach(el -> {
+                JsonObject item = el.getAsJsonObject();
+                if (item.has("errorMsg") && item.has("orderId"))
+                    results.add(OrderResult.error(item.get("errorMsg").getAsString(), item.get("orderId").getAsString(), pair));
+            });
+            // 4. Парсим ответ
+            JsonNode root = objectMapper.readTree(response);
+            if (!validateJsonResopnse(response)) {
+                logger.warn("Orders not setupeds");
+            } else {
+                logger.info("Orders placed successfully: {}", root.path("data").path("orderId").asText());
+
+            }
+
+
+        } catch (Exception e) {
+            logger.error("Orders failed for symbol {}: {}", pair, e.getMessage());
+            throw new ApiException("Orders placement failed: " + e.getMessage());
+        }
+        return results;
+    }
+
+    @Override
+    public OrderResult placeStopLoss(UserEntity user, Position position, String stopLoss, SymbolInfo info) {
+        BigDecimal sl = new BigDecimal(stopLoss).setScale(info.getPricePlace(), RoundingMode.HALF_EVEN);
+        stopLoss = sl.toPlainString();
+        String direction = position.getHoldSide();
+        String symbol = position.getSymbol();
+
+        custom.blue("-----------------------------------PLACE STOP-LOSS----------------------------------");
+        custom.info("StopLoss: {}, holdSide: {}, symbol: {}", stopLoss, direction, symbol);
+
+        try {
+            Map<String, Object> data = new HashMap<>();
+            data.put("symbol", symbol);
+            data.put("productType", "usdt-futures");
+            data.put("marginMode", "isolated");
+            data.put("marginCoin", "USDT");
+            data.put("planType", "pos_loss");
+            data.put("triggerPrice", stopLoss);
+            data.put("triggerType", "fill_price");
+            data.put("executePrice", "0");
+            data.put("holdSide", direction);
+
+            String payload = objectMapper.writeValueAsString(data);
+            logger.info("Payload formed: {}", payload);
+
+            String response = postToBitGet("/api/v2/mix/order/place-tpsl-order", user, payload);
+            custom.warn("RESPONSE: {}", response);
+
+            // 4. Парсим ответ
+            JsonNode root = objectMapper.readTree(response);
+            if (!validateJsonResopnse(response)) {
+                logger.warn("Stop loss not placed");
+            } else {
+                String oId = root.path("data").path("orderId").asText();
+                stopLossId = oId;
+                logger.info("Stop loss placed success: {}", oId);
+
+                return OrderResult.ok("Stoploss placed", oId, symbol);
+            }
+
+        } catch (Exception e) {
+            logger.error("Stop loss failed for symbol {}: {}", symbol, e.getMessage());
+            return OrderResult.error(e.getMessage(), "none", symbol);
+        }
+        custom.blue("------------------------------------STOP-LOSS PLACED----------------------------------");
+        return OrderResult.no();
+    }
+
+
+    public String postToBitGet(String endpoint, UserEntity user, String params) {
+        logger.info("Генерируем POST подпись (HMAC)");
+        System.err.println("Endpoint: --> " + endpoint);
+        String timestamp = String.valueOf(System.currentTimeMillis());
+        String method = "POST";
+
+        String api = security.decrypt(user.getApiKey());
+        String secret = security.decrypt(user.getSecretKey());
+        String phrase = security.decrypt(user.getPhrase());
+
+        String sign = security.generateSignature(timestamp + method + endpoint + params, secret);
+        // 2. Формируем запрос
+
+        logger.info("Формируем POST запрос");
+        Request request = new Request.Builder()
+                .url(BITGET_API_BASE_URL + endpoint)
+                .addHeader("ACCESS-KEY", api)
+                .addHeader("ACCESS-SIGN", sign)
+                .addHeader("ACCESS-TIMESTAMP", timestamp)
+                .addHeader("ACCESS-PASSPHRASE", phrase)
+                .addHeader("Content-Type", "application/json")
+                .post(RequestBody.create(params, MediaType.get("application/json")))
+                .build();
+
+        // 3. Отправляем запрос
+        custom.info("Отправляем запрос");
+
+        try (Response response = client.newCall(request).execute()) {
+            return Objects.requireNonNull(response.body()).string();
+        } catch (IOException e) {
+            logger.error("Произошла ошибка отправки POST запроса в BitGet: {}", e.getMessage());
+            throw new ApiException(e.getMessage());
+        } catch (Exception e) {
+            logger.error("Произошла критичиская ошибка отправки запроса: ", e);
+            throw new ApiException(e.getMessage());
+        }
+    }
+
+    public OrderResult updateStopLoss(UserEntity user, String orderId, String symbol, BigDecimal newStop) {
+        System.out.println("Trailing stop loss...");
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("orderId", orderId);
+        payload.put("marginCoin", "USDT");
+        payload.put("productType", "USDT-FUTURES");
+        payload.put("symbol", symbol);
+        payload.put("triggerPrice", newStop.toPlainString());
+        payload.put("triggerType", "fill_price");
+        payload.put("executePrice", "0");
+        payload.put("size", "");
+
+
+        try {
+
+            String response = postToBitGet("/api/v2/mix/order/modify-tpsl-order", user, objectMapper.writeValueAsString(payload));
+            custom.warn(response);
+            JsonNode root = objectMapper.readTree(response);
+
+            if (!validateJsonResopnse(response)) {
+                return OrderResult.error("Stop loss trailing fail: " + root.path("msg"), orderId, symbol);
+            }
+        } catch (Exception e) {
+            return OrderResult.error(e.getMessage(), orderId, symbol);
+        }
+        System.out.println("Stop loss trailing success");
+        return OrderResult.ok("OK", orderId, symbol);
+    }
+
+    @Override
+    public List<PositionsModel> getHistoryPositions(UserEntity user) {
+        List<PositionsModel> orders = new ArrayList<>();
+
+        try {
+            JSONArray array = getResponseArray("list", user, GET_HISTORY_POSITIONS_ENDPOINT);
+            if (array != null) {
+                for (int i = 0; i < array.length(); i++) {
+                    JSONObject object = array.getJSONObject(i);
+                    orders.add(new PositionsModel(
+                            object.getString("positionId"),
+                            object.getString("symbol"),
+                            object.getString("holdSide"),
+                            null,
+                            user.getPlecho(),
+                            object.getString("pnl"),
+                            object.getString("openAvgPrice"),
+                            object.getString("closeAvgPrice"),
+                            "close",
+                            object.getString("netProfit")
+                    ));
+                }
+            }
+        } catch (NetworkException e) {
+            logger.error("Error:", e);
+        }
+        return orders;
+    }
+
+    @Override
+    public OrderResult changeLeverge(UserEntity user, String pair, String side, int leverage) {
+        try {
+            long timestamp = System.currentTimeMillis();
+            String api = security.decrypt(user.getApiKey());
+            String secret = security.decrypt(user.getSecretKey());
+            String phrase = security.decrypt(user.getPhrase());
+            String path = "/api/v2/mix/account/set-leverage";
+            String method = "POST";
+
+
+            Map<String, String> orderMap = new HashMap<>();
+            orderMap.put("symbol", pair);
+            orderMap.put("productType", "usdt-futures");
+            orderMap.put("marginCoin", "USDT");
+            orderMap.put("leverage", String.valueOf(leverage));
+            orderMap.put("holdSide", side);
+
+            String body = objectMapper.writeValueAsString(orderMap);
+            System.err.println(body);
+
+            String sign = security.generateSignature(timestamp + method + path + body, secret);
+            // 2. Формируем запрос
+            Request request = new Request.Builder()
+                    .url(BITGET_API_BASE_URL + path)
+                    .post(RequestBody.create(body, MediaType.get("application/json")))
+                    .addHeader("ACCESS-KEY", api)
+                    .addHeader("ACCESS-SIGN", sign)
+                    .addHeader("ACCESS-TIMESTAMP", String.valueOf(timestamp))
+                    .addHeader("ACCESS-PASSPHRASE", phrase)
+                    .addHeader("Content-Type", "application/json")
+                    .build();
+
+            // 3. Отправляем запрос
+            custom.info("Отправляем запрос");
+
+            try (Response response = client.newCall(request).execute()) {
+                String responseBody = Objects.requireNonNull(response.body()).string();
+                custom.warn(responseBody);
+                if (validateJsonResopnse(responseBody)) {
+                    return OrderResult.ok("Плечо сменено", "id", pair);
+                } else {
+                    return OrderResult.error("Invalid ti", "id", pair);
+                }
+            }
+        } catch (IOException e) {
+            logger.error("Произошла ошибка смены плеча в BitGet: {}", e.getMessage());
+            throw new ApiException(e.getMessage());
+        } catch (Exception e) {
+            logger.error("Произошла критичиская ошибка смены плеча в BitGet: ", e);
+            throw new ApiException(e.getMessage());
+        }
+    }
+
+    public void startPositionMonitor(UserEntity user, String symbol, Signal signal, BigDecimal size, BitGetWS ws, BigDecimal margin, SymbolInfo info) {
+        String api = security.decrypt(user.getApiKey());
+        String secret = security.decrypt(user.getSecretKey());
+        String phrase = security.decrypt(user.getPhrase());
+
+        Thread.startVirtualThread(() -> {
+            try {
+                ws.connect();
+                ws.waitForConnection();
+                ws.waitForAuthentication();
+
+                ws.addSignal(symbol);
+
+                ws.addPositionListener(symbol, position -> {
+                    custom.info("Position monitor worked.");
+                    if (!isPositioned.getT()) {
+                        placeStopLoss(user, position, signal.getStopLoss(), info);
+                        ws.setStopId(stopLossId);
+                        custom.info("Setuped sl: {}", stopLossId);
+
+                        setupTP(signal, user, size, new BigDecimal(signal.getStopLoss()), ws, margin, info);
+                        custom.info("Setuped tp");
+
+                        isPositioned.setT(true);
+                    }
+                });
+            } catch (Exception e) {
+                logger.error("WebSocket ERROR: ", e);
+            }
+        });
+    }
+
+    @Override
+    public List<Ticker> getAllTickers() {
+        List<Ticker> tickers = new ArrayList<>();
+        Request request = new Request.Builder()
+                .url(BITGET_API_BASE_URL + GET_SYMBOLS)
+                .build();
+
+        try (Response response = client.newCall(request).execute()) {
+            String responseBody = Objects.requireNonNull(response.body()).string();
+
+            JSONObject ret = new JSONObject(responseBody);
+            JSONArray data = ret.getJSONArray("data");
+
+            for (int i = 0; i < data.length(); i++) {
+                JSONObject ticker = data.getJSONObject(i);
+                tickers.add(new Ticker(ticker.getString("symbol"), new BigDecimal(ticker.optString("lastPr", "0.0")), new BigDecimal(ticker.optString("markPrice", "0.0"))));
+            }
+        } catch (Exception e) {
+            logger.error("ERR ", e);
+        }
+
+        return tickers;
+    }
+
+    @Override
+    public OrderResult modifyOrder(UserEntity user, Map<String, String> data) {
+        custom.blue("-----------------------------------MODIFY ORDER----------------------------------");
+        custom.info("orderId: {}, payload: {}", data.get("orderId"), data);
+
+        try {
+            String payload = objectMapper.writeValueAsString(data);
+            logger.info("Payload to modify formed: {}", payload);
+
+            String response = postToBitGet("/api/v2/mix/order/modify-order", user, payload);
+            custom.warn("RESPONSE: {}", response);
+
+            // 4. Парсим ответ
+            JsonNode root = objectMapper.readTree(response);
+            if (!validateJsonResopnse(response)) {
+                logger.warn("Order not modified");
+            } else {
+                String oId = root.path("data").path("orderId").asText();
+                logger.info("Order modify success: {}", oId);
+
+                return OrderResult.ok("Order modify success", oId, data.get("symbol"));
+            }
+
+        } catch (Exception e) {
+            String symbol = data.get("symbol");
+            logger.error("Modify order failed for symbol {}: {}", symbol, e.getMessage());
+            return OrderResult.error(e.getMessage(), "none", symbol);
+        }
+        custom.blue("------------------------------------ORDER MODIFIED----------------------------------");
+        return OrderResult.no();
+    }
+
+    @Override
+    public void setMarginMode(UserEntity user, String mode, String symbol) {
+        Map<String, String> data = new HashMap<>();
+        data.put("symbol", symbol);
+        data.put("productType", "USDT-FUTURES");
+        data.put("marginCoin", "USDT");
+        data.put("marginMode", mode);
+        try {
+            String payload = objectMapper.writeValueAsString(data);
+            logger.info("Payload to set margin mode: {}", payload);
+
+            String response = postToBitGet("/api/v2/mix/account/set-margin-mode", user, payload);
+            custom.warn("RESPONSE: {}", response);
+
+            // 4. Парсим ответ
+            JsonNode root = objectMapper.readTree(response);
+            if (!validateJsonResopnse(response)) {
+                logger.warn("Margin mode not changed(");
+            } else {
+                String oId = root.path("data").path("orderId").asText();
+                logger.info("Margin mode changed success: {}", oId);
+            }
+
+        } catch (Exception e) {
+            logger.error("Margin mode changed success {}: {}", symbol, e.getMessage());
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.plovdev.bot.modules.beerjes;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.plovdev.bot.modules.beerjes.bitunix.BitUnixOrderOpener;
+import com.plovdev.bot.modules.beerjes.bitunix.BitUnixStopLossTrailer;
+import com.plovdev.bot.modules.beerjes.bitunix.BitUnixTakesSetuper;
+import com.plovdev.bot.modules.beerjes.monitoring.BitUnixWS;
+import com.plovdev.bot.modules.beerjes.security.BitGetSecurity;
+import com.plovdev.bot.modules.beerjes.security.BitUnixSecurity;
+import com.plovdev.bot.modules.beerjes.security.EncryptionService;
+import com.plovdev.bot.modules.beerjes.utils.BeerjUtils;
+import com.plovdev.bot.modules.databases.UserEntity;
+import com.plovdev.bot.modules.exceptions.ApiException;
+import com.plovdev.bot.modules.exceptions.InvalidParametresException;
+import com.plovdev.bot.modules.exceptions.NetworkException;
+import com.plovdev.bot.modules.logging.Colors;
+import com.plovdev.bot.modules.models.*;
+import com.plovdev.bot.modules.parsers.Signal;
+import com.plovdev.bot.modules.parsers.SignalCorrector;
+import okhttp3.*;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import static com.plovdev.bot.modules.beerjes.utils.BitUnixUtils.*;
+
+public class BitUnixTradeService implements TradeService {
+    private final Logger logger = LoggerFactory.getLogger("BitUnixTradeService");
+    private final com.plovdev.bot.modules.logging.Logger custom = new com.plovdev.bot.modules.logging.Logger();
+    private final BitUnixSecurity security;
+    private final SettingsService settingsService = new SettingsService();
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private String stopLossId = "";
+    private final TypeValueSwitcher<Boolean> isPositioned = new TypeValueSwitcher<>(false);
+    private StopInProfitTrigger trigger;
+
+    /**
+     * Констуктор класса.
+     * Инициализирует сервис, для работы с безопасностью.
+     *
+     * @param security сервис для работы с безопасностью, шифрованием, и тд.
+     */
+    public BitUnixTradeService(BitUnixSecurity security) {
+        this.security = security;
+    }
+
+
+    /**
+     * Метод, который открывает ордер, и возвращает результат.
+     *
+     * @param signal сигнал, который нужно открыть. Содержит всю информацию о сигнале
+     *               типа targets, stop-loss, tp, type(limit, mraket) и тд.
+     * @param user   Пользователь, у которого будет открываться сигнал.
+     * @return Результат открытия сигнала.
+     */
+    @Override
+    public OrderResult openOrder(Signal signal, UserEntity user, SymbolInfo symbolInfo, BigDecimal entry) throws Exception {
+        printPart("place order");
+        long startOpenTime = System.currentTimeMillis();
+        SignalCorrector.correct(signal, BeerjUtils.BITUNIX);
+        custom.info(signal.toString());
+        System.out.println();
+        System.out.println();
+        trigger = StopInProfitTrigger.load(user.getGroup());
+
+        String symbol = signal.getSymbol();
+        String direction = signal.getDirection();
+        String strategy = user.getGroup().toLowerCase();
+        String srcFrom = signal.getSrc().toLowerCase();
+        BitUnixOrderOpener opener = new BitUnixOrderOpener(signal, security, this);
+
+        int effectiveLeverage = getEffectiveLeverage(symbolInfo.getMaxLever(), Integer.parseInt(user.getPlecho()));
+        BigDecimal leverage = BigDecimal.valueOf(effectiveLeverage);
+
+        CompletableFuture<OrderResult> changeLeverFuture = CompletableFuture.supplyAsync(() -> changeLeverge(user, symbol, direction, effectiveLeverage));
+        CompletableFuture<Void> changeMarginModeFuture = CompletableFuture.supplyAsync(() -> {
+            setMarginMode(user, "ISOLATION", symbol);
+            return null;
+        });
+        CompletableFuture<OrderResult> validateOpen = CompletableFuture.supplyAsync(() -> BeerjUtils.valdateOpen(user, signal));
+        CompletableFuture<BigDecimal> getPs = CompletableFuture.supplyAsync(() -> BeerjUtils.getPosSize(user, signal, this, entry));
+        CompletableFuture.allOf(changeLeverFuture, changeMarginModeFuture, validateOpen, getPs).join();
+
+        logger.info("Configurated environment.");
+        //----------------------------------------------------------\\
+        logger.info("Validating user. Id: {}, name: {}", user.getTgId(), user.getTgName());
+        OrderResult canNext = validateOpen.get();
+        if (!canNext.succes()) {
+            logger.warn("This user cannot next open order. Has open position for symbol: {}", symbol);
+            return canNext;
+        }
+        logger.info("User can open order!\n\n");
+
+        BigDecimal positionSize = getPs.get().multiply(leverage);
+
+        List<String> types = signal.getTypeOreder();
+        BigDecimal oneOrderSize = (new BigDecimal("100.0").divide(BigDecimal.valueOf(types.size()), symbolInfo.getPricePlace(), RoundingMode.HALF_EVEN)).divide(new BigDecimal("100.0"), 2, RoundingMode.HALF_EVEN);
+        BigDecimal totalSize = setSize(symbolInfo, positionSize.multiply(oneOrderSize).setScale(symbolInfo.getVolumePlace(), RoundingMode.HALF_EVEN));
+        custom.warn("Total size before scaling: {}", totalSize);
+
+        logger.info("Try change leverage. New lever: {}", effectiveLeverage);
+        OrderResult leverResult = changeLeverFuture.get();
+        if (!leverResult.succes()) {
+            logger.info("Leverage not changed successfuly");
+            return leverResult;
+        }
+        changeMarginModeFuture.get();
+        logger.info("Leverage changed.\n\n");
+
+
+        logger.info("Getting variable values: positionSize: {}, leverage: {}, direction: {}, types size: {}, types: {}", positionSize, leverage, direction, types.size(), types);
+        logger.info("One order size: {}, totalSize: {}\n\n", oneOrderSize, totalSize);
+
+        logger.info("Put orders payload.");
+        List<Map<String, String>> ordersPayload = new ArrayList<>();
+        if (types.contains("market")) {
+            ordersPayload.add(opener.placeOrder(symbol, direction, totalSize, "MARKET", null));
+            logger.info("Added market order to payload.");
+        }
+
+        if (types.size() > 1 || !types.contains("market")) {
+            BigDecimal totalMargin = BigDecimal.ZERO;
+            for (int i = types.contains("market") ? 1 : 0; i < types.size(); i++) {
+                ordersPayload.add(opener.placeOrder(symbol, direction, totalSize, "LIMIT", new BigDecimal(types.get(i))));
+                logger.info("Added limit order to payload.");
+            }
+        }
+
+        logger.info("Batch orders payload formed: {}", ordersPayload);
+        List<OrderResult> results = placeOrders(user, symbol, ordersPayload);
+        for (OrderResult result : results) {
+            if (!result.succes()) {
+                return result;
+            }
+        }
+
+        BitUnixWS ws = new BitUnixWS(user, this, symbol);
+        if (types.contains("market")) {
+            try {
+                CompletableFuture<Position> positionFuture = CompletableFuture.supplyAsync(() -> getPositions(user).stream().filter(p -> {
+                    System.out.println("Pos symbol: " + p.getSymbol());
+                    System.out.println("Pos side: " + p.getHoldSide());
+                    return p.getSymbol().equalsIgnoreCase(symbol);
+                }).toList().getFirst());
+                Position position = positionFuture.get();
+
+                CompletableFuture<Void> setupStop = CompletableFuture.supplyAsync(() -> {
+                    try {
+                        OrderResult stopLossResult = placeStopLoss(user, position, signal.getStopLoss(), symbolInfo);
+                        custom.info("Setuped sl: {}", stopLossResult.id());
+                        ws.setStopId(position.getPosId());
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                    return null;
+                });
+                CompletableFuture.allOf(setupStop).join();
+
+                CompletableFuture<Void> setupTakes = CompletableFuture.supplyAsync(() -> {
+                    setupTP(signal, user, totalSize, new BigDecimal(signal.getStopLoss()), position.getPosId(), totalSize, symbolInfo, ws);
+                    custom.info("Setuped tp");
+                    return null;
+                });
+
+                CompletableFuture.allOf(setupTakes).join();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        logger.info("Starting position monitor...");
+        startPositionMonitor(user, symbol, signal, totalSize, ws, totalSize, symbolInfo);
+        logger.info("Position monitor started.");
+
+        long endTimeOpening = System.currentTimeMillis();
+        long totalTimeMillis = endTimeOpening - startOpenTime;
+        long totalTimeSecs = (endTimeOpening - startOpenTime) / 1000;
+        logger.info("TOTALS: Order opened for {}ms({}s)", totalTimeMillis, totalTimeSecs);
+
+        return OrderResult.ok("Position placed, userId: " + user.getTgId() + ", tgName: " + user.getTgName(), results.getFirst().id(), symbol);
+    }
+
+    private BigDecimal setSize(SymbolInfo symbolInfo, BigDecimal totalSize) {
+        BigDecimal sizeMultiplier = symbolInfo.getSizeMultiplier();
+        if (!BeerjUtils.isMultiple(totalSize, sizeMultiplier)) {
+            totalSize = totalSize.divide(sizeMultiplier, symbolInfo.getVolumePlace(), RoundingMode.HALF_EVEN).multiply(sizeMultiplier);
+            if (totalSize.compareTo(symbolInfo.getMinTradeNum()) < 0) {
+                totalSize = symbolInfo.getMinTradeNum();
+            }
+        }
+        return totalSize;
+    }
+
+    public OrderResult updateStopLoss(UserEntity user, String positionId, String pair, BigDecimal newStop) {
+        printPart("updating stop-loss");
+        System.out.println("\n\n");
+
+        try {
+            Map<String, Object> data = new HashMap<>();
+            data.put("symbol", pair);
+            data.put("positionId", positionId);
+            data.put("slPrice", newStop.toPlainString());
+
+            String payload = objectMapper.writeValueAsString(data);
+            custom.warn(payload);
+
+            String response = postToBitUnix("/api/v1/futures/tpsl/position/modify_order", user, payload);
+
+            // 4. Парсим ответ
+            JsonNode root = objectMapper.readTree(response);
+            if (!validateJsonResopnse(response)) {
+                logger.warn("Stop loss not trailing");
+            } else {
+                String oId = root.path("data").path("orderId").asText();
+                logger.info("Stop loss trailing success: {}", oId);
+
+                return OrderResult.ok("Stop loss trailed", oId, pair);
+            }
+
+        } catch (Exception e) {
+            logger.error("Stop loss trailing failed for symbol {}: {}", pair, e.getMessage());
+            return OrderResult.error(e.getMessage(), "none", pair);
+        }
+        return OrderResult.no();
+    }
+
+    public void printPart(String word, Object... objects) {
+        String part = "-".repeat(45);
+        word = word.trim().toUpperCase();
+
+        String str = part + word + part;
+        custom.blue(str, objects);
+    }
+
+    @Override
+    public OrderResult closeOrder(UserEntity user, Order order) {
+        return cancelLimits(user, order.getSymbol(), List.of(order.getOrderId())).getFirst();
+    }
+
+    /**
+     * Метод для расчета размера позиции в USDT.
+     *
+     * @param user       пользователь.
+     * @param entryPrice цена.
+     * @param stopLoss   стоп-лосс.
+     * @return размер позиции в USDT.
+     */
+    @Override
+    public BigDecimal calculatePositionSize(UserEntity user, BigDecimal entryPrice, BigDecimal stopLoss, String positionSide) {
+        BigDecimal totalSize;
+        if (entryPrice.compareTo(BigDecimal.ZERO) <= 0 || stopLoss.compareTo(BigDecimal.ZERO) <= 0)
+            throw new InvalidParametresException("Цена входа или стоп-лосс выставленны неверно! User ID: " + user.getTgId() + ". Username: " + user.getTgName());
+
+
+        BigDecimal stopLosssDistantionPercent;
+        if (positionSide.equals("LONG")) {
+            // Для лонга: (entry - stopLoss) / entry
+            stopLosssDistantionPercent = (entryPrice.subtract(stopLoss))
+                    .divide(entryPrice, 10, RoundingMode.HALF_UP).abs();
+        } else {
+            // Для шорта: (stopLoss - entry) / entry
+            stopLosssDistantionPercent = (stopLoss.subtract(entryPrice))
+                    .divide(entryPrice, 10, RoundingMode.HALF_UP).abs();
+        }
+
+        String varinat = user.getVariant();
+
+        if (varinat.equals("proc")) {
+            BigDecimal balance = getBalance(user);
+            BigDecimal percents = new BigDecimal(user.getProc());
+            if (percents.compareTo(BigDecimal.ZERO) <= 0) {
+                throw new InvalidParametresException("Процент пользователя меньше или равен 0. User ID: \"+ user.getTgId() + \". Username: \" + user.getTgName()-------------- Percent: " + percents);
+            }
+
+            BigDecimal riskAmount = BeerjUtils.getPercent(balance, percents);
+            BigDecimal size = riskAmount.divide(stopLosssDistantionPercent, 10, RoundingMode.HALF_UP);
+
+            custom.log("Пользователь ID: {}, usrname: {}", "[INFO]", Colors.Blue.toString(), user.getTgId(), user.getTgName());
+            if (size.compareTo(BigDecimal.TEN) < 0)
+                throw new IllegalArgumentException("size имеет слишком маленькое значение: " + size.toPlainString());
+
+            custom.info("Расчёт размера позиции (риск %):");
+            custom.info("Баланс: {} USDT", balance);
+            custom.info("Размер позиции: {} USDT", size);
+            custom.info("цена входа: {}", entryPrice.toPlainString());
+
+
+            totalSize = size;
+        } else {
+            BigDecimal sum = new BigDecimal(user.getSum());
+            custom.info("Расчёт размера позиции (фиксираванная сумма):");
+            custom.info("Размер позиции: {} USDT", sum);
+            custom.info("цена входа: {}", entryPrice.toPlainString());
+
+            if (sum.compareTo(BigDecimal.TEN) < 0) {
+                throw new InvalidParametresException("У пользователя с id: " + user.getTgId() + ", name: " + user.getTgName() + " слишком малая сумма, хм.");
+            } else {
+                totalSize = sum.subtract(new BigDecimal("0.5"));;
+            }
+        }
+        totalSize = totalSize.divide(entryPrice, 10, RoundingMode.HALF_EVEN);
+        custom.info("И того в base coin: {}", totalSize.toPlainString());
+        return totalSize;
+    }
+
+    /**
+     * Получает минимальный размер ордера для сделки.
+     *
+     * @param user пользователь с ключами от биржи. Если его не сделать, то биржа будет блокировать мои запросы, поэтому это критически важно!!!
+     * @param pair пара.
+     * @return размер сделки.
+     */
+    @Override
+    public BigDecimal getLotSize(UserEntity user, String pair) throws NetworkException {
+        JSONArray array = getResponseArray("https://fapi.bitunix.com/api/v1/futures/market/trading_pairs?symbols=" + pair);
+        if (array != null) {
+            for (int i = 0; i < array.length(); i++) {
+                JSONObject tradeNum = array.getJSONObject(i);
+                if (tradeNum.has("minTradeVolume") && !tradeNum.isNull("minTradeVolume")) {
+                    return new BigDecimal(tradeNum.getString("minTradeVolume"));
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Возвращает лучшее плечо из ползовательского ввода, и биржевого.
+     *
+     * @return плечо.
+     */
+    @Override
+    public int getEffectiveLeverage(int max, int user) {
+        return Math.min(max, user);
+    }
+
+    private JSONArray getResponseArray(String end) throws NetworkException {
+        try (Response response = sendToBitUnix(end)) {
+            String responseBody = Objects.requireNonNull(response.body()).string();
+            boolean success = response.isSuccessful() && validateJsonResopnse(responseBody);
+            if (success) {
+                JSONObject object = new JSONObject(responseBody);
+                if (object.has("data") && !object.isNull("data")) {
+                    return object.getJSONArray("data");
+                }
+            } else {
+                logger.warn("https error; CODE: {}, BODY: {}", response.code(), responseBody);
+            }
+        } catch (IOException ex) {
+            custom.warn("Ошибка чтения с биржи:  {}", ex.getMessage());
+            throw new NetworkException(ex.getMessage());
+        } catch (Exception e) {
+            logger.error("Ошибка: ", e);
+            throw new ApiException(e.getMessage());
+        }
+        return null;
+    }
+
+    private JSONArray getAuthResponseArray(String end, String api, String secret, String ary) throws NetworkException {
+        try (Response response = sendToBitUnixWithAuth(end, api, secret)) {
+            String responseBody = Objects.requireNonNull(response.body()).string();
+            custom.info(responseBody);
+            boolean success = response.isSuccessful() && validateJsonResopnse(responseBody);
+            if (success) {
+                JSONObject object = new JSONObject(responseBody);
+                if (object.has(ary) && !object.isNull(ary)) {
+                    return object.getJSONArray(ary);
+                }
+            } else {
+                logger.warn("Error; CODE: {}, BODY: {}", response.code(), responseBody);
+            }
+        } catch (IOException ex) {
+            custom.warn("Ошибка чтения с биржи:  {}", ex.getMessage());
+            throw new NetworkException(ex.getMessage());
+        } catch (Exception e) {
+            logger.error("Ошибка: ", e);
+            throw new ApiException(e.getMessage());
+        }
+        return null;
+    }
+
+    private JSONArray getAuthResponseArray(String array, String end, String api, String secret, String ary) throws NetworkException {
+        try (Response response = sendToBitUnixWithAuth(end, api, secret)) {
+            String responseBody = Objects.requireNonNull(response.body()).string();
+            custom.info(responseBody + " - response body");
+            boolean success = response.isSuccessful() && validateJsonResopnse(responseBody);
+            if (success) {
+                JSONObject object = new JSONObject(responseBody);
+                if (object.has(array) && !object.isNull(array)) {
+                    JSONObject ar = object.getJSONObject(array);
+                    if (ar.has(ary) && !ar.isNull(ary)) {
+                        return ar.getJSONArray(ary);
+                    }
+                }
+            } else {
+                logger.warn("Error; CODE: {}, BODY: {}", response.code(), responseBody);
+            }
+        } catch (IOException ex) {
+            custom.warn("Ошибка чтения с биржи:  {}", ex.getMessage());
+            throw new NetworkException(ex.getMessage());
+        } catch (Exception e) {
+            logger.error("Ошибка: ", e);
+            throw new ApiException(e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Валидируем АПИ ключи.
+     *
+     * @param entity пользователь с ключами от биржи. Если его не сделать, то биржа будет блокировать мои запросы, поэтому это критически важно!!!
+     * @return true если ключи валидны, false если нет.
+     */
+    @Override
+    public boolean checkApiKeys(UserEntity entity) throws NetworkException {
+        System.err.println("BitUnixCheck");
+        try {
+            String responseBody = getFutureAccountMargin(entity);
+            System.out.println(responseBody);
+
+            boolean success = validateJsonResopnse(responseBody);
+            if (success) custom.info("Ключи подтверждены!");
+            else custom.warn("Ключи не подтверждены...");
+
+            return success;
+        } catch (Exception ex) {
+            logger.warn("Ошибка чтения ключей биржи: {}", ex.getMessage());
+            throw new NetworkException(ex.getMessage());
+        }
+    }
+
+    public boolean validateJsonResopnse(String json) {
+        JSONObject object = new JSONObject(json);
+        boolean code = false;
+        boolean msg = false;
+
+        if (object.has("code") && !object.isNull("code")) {
+            code = object.getInt("code") == 0;
+        }
+        if (object.has("msg") && !object.isNull("msg")) {
+            msg = object.getString("msg").toLowerCase().contains("success");
+        }
+        return code && msg;
+    }
+
+    /**
+     * Получает баланс пользователя.
+     *
+     * @param user пользователь с ключами от биржи. Если его не сделать, то биржа будет блокировать мои запросы, поэтому это критически важно!!! ктому же у этого пользователя мы и проверяем баланс!
+     * @return баланс пользователя.
+     */
+    @Override
+    public BigDecimal getBalance(UserEntity user) throws ApiException {
+        try {
+            String response = getFutureAccountMargin(user);
+            System.out.println(response);
+            JSONObject object = new JSONObject(response);
+            if (object.has("data") && !object.isNull("data")) {
+                JSONObject data = object.getJSONObject("data");
+                if (data.has("available") && !data.isNull("available")) {
+                    return new BigDecimal(data.getString("available"));
+                }
+            }
+        } catch (Exception e) {
+            System.out.println(e.getMessage());
+        }
+        return new BigDecimal("0.0");
+    }
+
+    @Override
+    public OrderResult closePosition(UserEntity user, Position position) {
+        try {
+            long timestamp = System.currentTimeMillis();
+            String api = security.decrypt(user.getApiKey());
+            String secret = security.decrypt(user.getSecretKey());
+            String path = "/api/v1/futures/trade/flash_close_position";
+            String nonce = generateNonce();
+            String method = "POST";
+
+            Map<String, String> orderMap = new HashMap<>();
+            orderMap.put("positionId", position.getPosId());
+
+            String body = objectMapper.writeValueAsString(orderMap);
+
+            System.err.println(body);
+            String sign = generateSignApi(api, secret, nonce, String.valueOf(timestamp), method, body);
+            // 2. Формируем запрос
+            OkHttpClient client = new OkHttpClient().newBuilder().connectTimeout(10, TimeUnit.SECONDS)
+                    .readTimeout(10, TimeUnit.SECONDS).writeTimeout(10, TimeUnit.SECONDS).build();
+            Request request = new Request.Builder()
+                    .url(BITUNIX_API_BASE_URL + path)
+                    .post(RequestBody.create(body, MediaType.get("application/json")))
+                    .addHeader("api-key", api)
+                    .addHeader("sign", sign)
+                    .addHeader("nonce", nonce)
+                    .addHeader("timestamp", String.valueOf(timestamp))
+                    .addHeader("language", "en-US")
+                    .addHeader("Content-Type", "application/json")
+                    .build();
+
+            // 3. Отправляем запрос
+            custom.info("Отправляем запрос");
+
+            try (Response response = client.newCall(request).execute()) {
+                String responseBody = Objects.requireNonNull(response.body()).string();
+                custom.warn(responseBody);
+                if (validateJsonResopnse(responseBody)) {
+                    return OrderResult.ok("Позиция закрыта", "none", position.getSymbol());
+                } else {
+                    return OrderResult.error("no success position closing", position.getPosId(), position.getSymbol());
+                }
+            }
+        } catch (IOException e) {
+            logger.error("Произошла ошибка закрытия позиции в BitUnix: {}", e.getMessage());
+            throw new ApiException(e.getMessage());
+        } catch (Exception e) {
+            logger.error("Произошла критичиская ошибка закрытия позиции: ", e);
+            throw new ApiException(e.getMessage());
+        }
+    }
+
+    @Override
+    public OrderResult placeStopLoss(UserEntity user, Position position, String stopLoss, SymbolInfo info) {
+        custom.blue("---------------------------------PLACE STOP-LOSS-------------------------");
+        custom.info("StopLoss: {}, holdSide: {}, symbol: {}", stopLoss, position.getHoldSide(), position.getSymbol());
+
+        String pair = position.getSymbol();
+
+        try {
+            Map<String, Object> data = new HashMap<>();
+            data.put("symbol", pair);
+            data.put("positionId", position.getPosId());
+            data.put("slPrice", stopLoss);
+
+            String payload = objectMapper.writeValueAsString(data);
+            logger.info("Payload formed: {}", payload);
+
+            String response = postToBitUnix("/api/v1/futures/tpsl/position/place_order", user, payload);
+            custom.warn(response);
+            // 4. Парсим ответ
+            JsonNode root = objectMapper.readTree(response);
+            if (!validateJsonResopnse(response)) {
+                logger.warn("Stop loss not placed");
+            } else {
+                String oId = root.path("data").path("orderId").asText();
+                stopLossId = position.getPosId();
+                logger.info("Stop loss placed success: {}", oId);
+
+                return OrderResult.ok("Stoploss placed", oId, pair);
+            }
+
+        } catch (Exception e) {
+            logger.error("Stop loss failed for symbol {}: {}", pair, e.getMessage());
+            return OrderResult.error(e.getMessage(), "none", pair);
+        }
+        custom.blue("---------------------------PLACED STOP-LOSS--------------------------------");
+        return OrderResult.no();
+    }
+
+    @Override
+    public EncryptionService getSecurityService() {
+        return security;
+    }
+
+    private Response sendToBitUnix(String path) {
+        OkHttpClient client = new OkHttpClient().newBuilder().connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS).writeTimeout(10, TimeUnit.SECONDS).build();
+        Request request = new Request.Builder()
+                .url(path)
+                .build();
+
+        // 3. Отправляем запрос
+
+
+        try {
+            return client.newCall(request).execute();
+        } catch (IOException e) {
+            logger.error("Произошла ошибка отправки запроса в BitUnix: {}", e.getMessage());
+            throw new ApiException(e.getMessage());
+        } catch (Exception e) {
+            logger.error("Произошла критичиская ошибка отправки запроса: ", e);
+            throw new ApiException(e.getMessage());
+        }
+    }
+
+    private Response sendToBitUnixWithAuth(String path, String api, String sec) throws Exception {
+        String nonce = generateNonce();
+        String timestamp = String.valueOf(System.currentTimeMillis());
+        String method = "GET";
+
+        // Данные с параметром marginCoin
+        Map<String, String> data = new HashMap<>();
+
+        String sign = generateSignApi(api, sec, nonce, timestamp, method, data);
+
+        OkHttpClient client = new OkHttpClient().newBuilder().connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS).writeTimeout(10, TimeUnit.SECONDS).build();
+        Request request = new Request.Builder()
+                .url(BITUNIX_API_BASE_URL + path)
+                .header("api-key", api)
+                .header("sign", sign)
+                .header("nonce", nonce)
+                .header("timestamp", timestamp)
+                .header("language", "en-US")
+                .header("Content-Type", "application/json")
+                .get()
+                .build();
+
+        // 3. Отправляем запрос
+        custom.info("Отправляем запрос");
+
+        try {
+            return client.newCall(request).execute();
+        } catch (IOException e) {
+            logger.error("Произошла ошибка отправки запроса в BitUnix: {}", e.getMessage());
+            throw new ApiException(e.getMessage());
+        } catch (Exception e) {
+            logger.error("Произошла критичиская ошибка отправки запроса: ", e);
+            throw new ApiException(e.getMessage());
+        }
+    }
+
+    private Response sendToBitUnixWithAuth(String path, String api, String sec, Map<String, String> data) throws Exception {
+        String nonce = generateNonce();
+        String timestamp = String.valueOf(System.currentTimeMillis());
+        String method = "GET";
+        String sign = generateSignApi(api, sec, nonce, timestamp, method, data);
+
+        OkHttpClient client = new OkHttpClient().newBuilder().connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS).writeTimeout(10, TimeUnit.SECONDS).build();
+        Request request = new Request.Builder()
+                .url(BITUNIX_API_BASE_URL + path)
+                .header("api-key", api)
+                .header("sign", sign)
+                .header("nonce", nonce)
+                .header("timestamp", timestamp)
+                .header("language", "en-US")
+                .header("Content-Type", "application/json")
+                .get()
+                .build();
+
+        // 3. Отправляем запрос
+        custom.info("Отправляем запрос");
+
+        try {
+            return client.newCall(request).execute();
+        } catch (IOException e) {
+            logger.error("Произошла ошибка отправки запроса в BitUnix: {}", e.getMessage());
+            throw new ApiException(e.getMessage());
+        } catch (Exception e) {
+            logger.error("Произошла критичиская ошибка отправки запроса: ", e);
+            throw new ApiException(e.getMessage());
+        }
+    }
+
+    public BigDecimal getEntryPrice(String pair) {
+        try {
+            JSONArray array = getResponseArray("https://fapi.bitunix.com/api/v1/futures/market/tickers?symbols=" + pair);
+            if (array != null) {
+                for (int i = 0; i < array.length(); i++) {
+                    JSONObject leverage = array.getJSONObject(i);
+                    if (leverage.has("markPrice") && !leverage.isNull("markPrice")) {
+                        return new BigDecimal(leverage.getString("markPrice"));
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.error("e: ", e);
+        }
+        return null;
+    }
+
+    /**
+     * Метод, который возвращает сервис безопасности.
+     *
+     * @return сервис безопаснисти BitGet.
+     */
+    public BitGetSecurity getSecurity() {
+        return security;
+    }
+
+    @Override
+    public List<OrderResult> cancelLimits(UserEntity user, String pair, List<String> ids) {
+        logger.info("-------------------------------------Cancel limits----------------------------------------------");
+        List<OrderResult> results = new ArrayList<>();
+        String api = security.decrypt(user.getApiKey());
+        String secret = security.decrypt(user.getSecretKey());
+
+        String nonce = generateNonce();
+        String timestamp = String.valueOf(System.currentTimeMillis());
+        String method = "POST";
+        logger.info("Sign generates");
+
+        List<String> bds = ids.stream().map(s -> String.format("{\"orderId\":\"%s\"}", s)).toList();
+        String body = String.format("""
+                {
+                "symbol": "%2s",
+                "orderList": %2s
+                }
+                """, pair, bds);
+
+        System.err.println(pair + " - PAIR");
+        System.out.println(body);
+
+        String sign;
+        try {
+            sign = generateSignApi(api, secret, nonce, timestamp, method, body);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
+        String path = BITUNIX_API_BASE_URL + "/api/v1/futures/trade/cancel_orders";
+
+        // 2. Формируем запрос
+        OkHttpClient client = new OkHttpClient().newBuilder().connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS).writeTimeout(10, TimeUnit.SECONDS).build();
+        Request request = new Request.Builder()
+                .url(path)
+                .post(RequestBody.create(body, MediaType.get("application/json")))
+                .addHeader("api-key", api)
+                .addHeader("sign", sign)
+                .addHeader("nonce", nonce)
+                .addHeader("timestamp", timestamp)
+                .addHeader("language", "en-US")
+                .addHeader("Content-Type", "application/json")
+                .build();
+
+        // 3. Отправляем запрос
+        custom.info("Отправляем запрос");
+
+        try (Response response = client.newCall(request).execute()) {
+            String responseBody = Objects.requireNonNull(response.body()).string();
+            custom.info("RESPONSE DATA:");
+            custom.warn(responseBody);
+            if (validateJsonResopnse(responseBody)) {
+                results.add(OrderResult.ok("ордер отменен", "none", pair));
+            } else {
+                results.add(OrderResult.error("no success order canceling", "123", pair));
+            }
+        } catch (IOException e) {
+            logger.error("Произошла ошибка отправки post запроса в BitGet: {}", e.getMessage());
+            throw new ApiException(e.getMessage());
+        } catch (Exception e) {
+            logger.error("Произошла критичиская ошибка отправки post запроса: ", e);
+            throw new ApiException(e.getMessage());
+        }
+        logger.info("------------------------------------------------------------------------------------");
+        return results;
+    }
+
+
+    @Override
+    public List<Order> getOrders(UserEntity user) {
+        String api = security.decrypt(user.getApiKey());
+        String secret = security.decrypt(user.getSecretKey());
+        String end = "/api/v1/futures/trade/get_pending_orders";
+        List<Order> orders = new ArrayList<>();
+
+        try {
+            JSONArray array = getAuthResponseArray("data", end, api, secret, "orderList");
+            if (array != null) {
+                for (int i = 0; i < array.length(); i++) {
+                    JSONObject object = array.getJSONObject(i);
+                    boolean isReduce = object.getBoolean("reduceOnly");
+
+                    orders.add(new Order(
+                            object.getString("symbol"),                    // symbol
+                            new BigDecimal(object.getString("qty")),      // size (qty)
+                            object.getString("orderId"),                  // orderId
+                            object.getString("clientId"),                 // clientOid (clientId)
+                            new BigDecimal(object.getString("tradeQty")), // filledQty (tradeQty)
+                            object.getString("fee"),                      // fee
+                            new BigDecimal(object.getString("price")),    // price
+                            object.getString("status"),                   // state (status)
+                            "limit",    // side (из type)
+                            object.getString("effect"),                   // timeInForce (effect)
+                            object.getString("realizedPNL"),              // totalProfits (realizedPNL)
+                            object.getString("positionMode"), // posSide
+                            "USDT",                                       // marginCoin (предполагаем USDT)
+                            new BigDecimal(object.optString("tpPrice", "0.0")), // presetTakeProfitPrice
+                            new BigDecimal(object.optString("slPrice", "0.0")), // presetStopLossPrice
+                            new BigDecimal(object.getString("tradeQty")), // filledAmount (tradeQty)
+                            "limit",                     // orderType (type)
+                            object.getInt("leverage"),                    // leverage
+                            object.getString("marginMode"),               // marginMode
+                            isReduce,              // reduceOnly
+                            isReduce? "close" : "open",       // tradeSide (из type)
+                            object.getString("positionMode"), // holdMode (из positionMode)
+                            "API",                   // orderSource (source)
+                            String.valueOf(object.getLong("ctime")),      // cTime
+                            String.valueOf(object.getLong("mtime"))       // uTime
+                    ));
+                }
+            }
+        } catch (NetworkException e) {
+            logger.error("Error:", e);
+        }
+        return orders;
+    }
+
+
+    @Override
+    public List<Position> getPositions(UserEntity user) {
+        String api = security.decrypt(user.getApiKey());
+        String secret = security.decrypt(user.getSecretKey());
+        String end = "/api/v1/futures/position/get_pending_positions";
+        List<Position> orders = new ArrayList<>();
+
+        try {
+            JSONArray array = getAuthResponseArray(end, api, secret, "data");
+            if (array != null) {
+                for (int i = 0; i < array.length(); i++) {
+                    JSONObject object = array.getJSONObject(i);
+                    orders.add(new Position(
+                            object.getString("positionId"),
+                            "USDT",
+                            object.getString("symbol"),
+                            object.getString("side"),
+                            null,
+                            new BigDecimal(object.getString("avgOpenPrice")),
+                            null,
+                            new BigDecimal(object.optString("qty", "0.0")),
+                            object.getInt("leverage"),
+                            new BigDecimal(object.getString("unrealizedPNL")),
+                            new BigDecimal("0.0"),//object.get("liqPrice") == null? new BigDecimal("0.0") : new BigDecimal(object.getString("liqPrice")),
+                            new BigDecimal(object.getString("marginRate")),
+                            new BigDecimal(object.getString("avgOpenPrice")),
+                            object.getString("ctime"),
+                            object.getString("mtime"),
+                            new BigDecimal(object.optString("avgOpenPrice", "0.0")),
+                            false
+                    ));
+                }
+            }
+        } catch (NetworkException e) {
+            logger.error("Error:", e);
+        }
+        return orders;
+    }
+
+    public void setupTP(Signal signal, UserEntity user, BigDecimal positionSize, BigDecimal stopLoss, String posId, BigDecimal margin, SymbolInfo symbolInfo, BitUnixWS ws) {
+        try {
+            logger.info("Setuping takes: {}", signal);
+            BitUnixStopLossTrailer trailer = new BitUnixStopLossTrailer(this, trigger);
+            BitUnixTakesSetuper setuper = new BitUnixTakesSetuper(trigger, this, trailer);
+
+            printPart("setuping take profits");
+            List<TakeProfitLevel> tpLevels = BeerjUtils.adjustTakeProfits(signal, positionSize, settingsService.getTPRationsByGroup(user.getGroup()), getEntryPrice(signal.getSymbol()), symbolInfo);
+            if (tpLevels.size()-1 <= trigger.getTakeToTrailNumber()) {
+                trigger.setTakeToTrailNumber(Math.max(tpLevels.size()-2, 0));
+            }
+
+            // 7. Выставляем тейки
+            List<Map<String, String>> orders = new ArrayList<>();
+            for (TakeProfitLevel level : tpLevels) {
+                try {
+                    Map<String, String> payload = new HashMap<>();
+                    payload.put("qty", level.getSize().toPlainString());
+                    payload.put("price", level.getPrice().toPlainString());
+                    payload.put("side", signal.getDirection().equalsIgnoreCase("long") ? "BUY" : "SELL");
+                    payload.put("tradeSide", "CLOSE");
+                    payload.put("positionId", posId);
+                    payload.put("orderType", "LIMIT");
+                    payload.put("effect", "GTC");
+
+
+                    payload.put("tpPrice", level.getPrice().toPlainString()); // Цена активации
+                    payload.put("tpOrderPrice", level.getPrice().toPlainString()); // Цена исполнения
+                    payload.put("tpOrderType", "LIMIT");
+                    payload.put("tpStopType", "MARK_PRICE");
+
+                    // ПРАВИЛЬНОЕ указание стоп-лосса:
+                    payload.put("slPrice", stopLoss.toPlainString());
+                    payload.put("slOrderType", "MARKET"); // Или "LIMIT" если нужна цена
+                    payload.put("slStopType", "MARK_PRICE");
+
+                    System.out.println("\n\n");
+                    custom.blue("Payload:");
+                    custom.warn(objectMapper.writeValueAsString(payload));
+                    System.out.println("\n\n");
+
+                    orders.add(payload);
+                } catch (Exception e) {
+                    logger.warn("Failed to place TP at {}: {}", level.getPrice(), e.getMessage());
+                }
+            }
+            List<OrderResult> results = placeOrders(user, signal.getSymbol(), orders);
+            setuper.manageTakesInMonitor(ws, signal.getSymbol(), user, results, stopLossId, tpLevels, symbolInfo, signal.getDirection());
+        } catch (Exception e) {
+            logger.error("Critical error in setupTP for user {}: {}", user.getTgId(), e.getMessage(), e);
+        }
+        printPart("take-profits placed");
+    }
+
+    private List<OrderResult> placeOrders(UserEntity user, String pair, List<Map<String, String>> orders) {
+        List<OrderResult> results = new ArrayList<>();
+        try {
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("symbol", pair);
+            payload.put("orderList", orders);
+            System.out.println("PAYLOAD: " + objectMapper.writeValueAsString(payload));
+
+            // Отправляем запрос
+            String response = postToBitUnix("/api/v1/futures/trade/batch_order", user, objectMapper.writeValueAsString(payload));
+            custom.warn(response);
+
+            JsonObject responseObject = new Gson().fromJson(response, JsonObject.class);
+            JsonObject dataObject = responseObject.getAsJsonObject("data");
+            JsonArray successList = dataObject.getAsJsonArray("successList");
+            successList.forEach(el -> {
+                JsonObject item = el.getAsJsonObject();
+                if (item.has("orderId"))
+                    results.add(OrderResult.ok("Order placed!", item.get("orderId").getAsString(), pair));
+            });
+            JsonArray failureList = dataObject.getAsJsonArray("failureList");
+            failureList.forEach(el -> {
+                JsonObject item = el.getAsJsonObject();
+                if (item.has("errorMsg") && item.has("clientId"))
+                    results.add(OrderResult.error(item.get("errorMsg").getAsString(), item.get("clientId").getAsString(), pair));
+            });
+
+            custom.warn("Take response: {}", response);
+
+        } catch (Exception e) {
+            logger.error("Failed to place limit order for user {}: {}", user.getTgId(), e.getMessage());
+        }
+        logger.info("Place orders result: {}", results);
+        return results;
+    }
+
+    public String postToBitUnix(String endpoint, UserEntity user, String body) {
+        try {
+            String nonce = generateNonce();
+            String method = "POST";
+
+            String api = security.decrypt(user.getApiKey());
+            String secret = security.decrypt(user.getSecretKey());
+            String url = "https://fapi.bitunix.com" + endpoint;
+
+            // 2. Создаём подпись (только для приватных запросов)
+            String timestamp = String.valueOf(System.currentTimeMillis());
+
+            String sign = generateSignApi(api, secret, nonce, timestamp, method, body);
+            String payload = timestamp + method + endpoint + body;
+
+            OkHttpClient client = new OkHttpClient().newBuilder().connectTimeout(10, TimeUnit.SECONDS)
+                    .readTimeout(10, TimeUnit.SECONDS).writeTimeout(10, TimeUnit.SECONDS).build();
+            Request request = new Request.Builder()
+                    .url(url)
+                    .addHeader("api-key", api)
+                    .addHeader("sign", sign)
+                    .addHeader("nonce", nonce)
+                    .addHeader("timestamp", timestamp)
+                    .addHeader("language", "en-US")
+                    .addHeader("Content-Type", "application/json")
+                    .post(RequestBody.create(body, MediaType.get("application/json")))
+                    .build();
+
+            // 3. Отправляем запрос
+            custom.info("Отправляем запрос");
+
+            try (Response response = client.newCall(request).execute()) {
+                return Objects.requireNonNull(response.body()).string();
+            } catch (IOException e) {
+                logger.error("Произошла ошибка отправки POST запроса в BitGet: {}", e.getMessage());
+                throw new ApiException(e.getMessage());
+            } catch (Exception e) {
+                logger.error("Произошла критичиская ошибка отправки запроса: ", e);
+                throw new ApiException(e.getMessage());
+            }
+
+        } catch (Exception e) {
+            throw new ApiException("Request failed to " + endpoint);
+        }
+    }
+
+
+    private Map<String, String> placeOrder(
+            UserEntity user,
+            String pair,
+            String side,
+            BigDecimal size,
+            String orderType,
+            BigDecimal price) {
+        custom.blue(size + " - order size");
+
+        String type = orderType.toUpperCase();
+        // Подготавливаем тело запроса
+        Map<String, String> payload = new HashMap<>();
+        payload.put("symbol", pair);
+        payload.put("qty", size.toString());
+        payload.put("price", price.toString());
+        payload.put("side", side.equalsIgnoreCase("long") ? "BUY" : "SELL");
+        payload.put("tradeSide", "OPEN");
+        payload.put("orderType", type);
+        if (type.equals("LIMIT")) payload.put("effect", "GTC");
+
+
+        return payload;
+    }
+
+    private void scheduleLimitOrderTimeout(UserEntity user, String pair) {
+        try (ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1)) {
+            scheduler.schedule(() -> {
+                try {
+                    List<Order> activeLimits = getOrders(user).stream()
+                            .filter(e -> e.getOrderType().equals("limit") && e.getState().equals("live")).toList();
+
+                    for (Order order : activeLimits) {
+                        boolean cancelled = closeOrder(user, order).succes();
+                        if (cancelled) {
+                            logger.info("Лимитный ордер по {} отменён (15 мин).", pair);
+                        }
+                    }
+                } catch (Exception e) {
+                    logger.error("Failed to cancel limit order by timeout", e);
+                }
+            }, Duration.ofMinutes(15).toMinutes(), TimeUnit.MINUTES);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+
+    public String getFutureAccountMargin(UserEntity entity) {
+        try (HttpClient httpClient = HttpClient.newBuilder().build()) {
+            String url = "https://fapi.bitunix.com/api/v1/futures/account";
+            String apiKey = security.decrypt(entity.getApiKey());
+            String secretKey = security.decrypt(entity.getSecretKey());
+
+            String nonce = generateNonce();
+            String timestamp = String.valueOf(System.currentTimeMillis());
+            String method = "GET";
+
+            // Данные с параметром marginCoin
+            Map<String, String> data = new HashMap<>();
+            data.put("marginCoin", "USDT");
+
+            String sign = generateSignApi(apiKey, secretKey, nonce, timestamp, method, data);
+
+            // Формируем query string для URL
+            String queryString = data.entrySet().stream()
+                    .map(entry -> entry.getKey() + "=" + entry.getValue())
+                    .collect(Collectors.joining("&"));
+
+            String fullUrl = url + "?" + queryString;
+            // Вывод для отладки
+            System.out.println("Headers:");
+            System.out.println("api-key: " + apiKey);
+            System.out.println("nonce: " + nonce);
+            System.out.println("timestamp: " + timestamp);
+            System.out.println("sign: " + sign);
+            System.out.println("URL: " + fullUrl);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(fullUrl))
+                    .header("api-key", apiKey)
+                    .header("nonce", nonce)
+                    .header("timestamp", timestamp)
+                    .header("sign", sign)
+                    .header("language", "en-US")
+                    .header("Content-Type", "application/json")
+                    .GET()
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            System.out.println("Response status: " + response.statusCode());
+            return response.body();
+        } catch (Exception e) {
+            System.out.println(e.getMessage());
+        }
+        return "";
+    }
+
+    @Override
+    public List<PositionsModel> getHistoryPositions(UserEntity user) {
+        String api = security.decrypt(user.getApiKey());
+        String secret = security.decrypt(user.getSecretKey());
+        List<PositionsModel> orders = new ArrayList<>();
+
+        try {
+            JSONArray array = getAuthResponseArray("data", "/api/v1/futures/position/get_history_positions", api, secret, "positionList");
+            if (array != null) {
+                for (int i = 0; i < array.length(); i++) {
+                    System.err.println("Parse new history positoin");
+                    JSONObject object = array.getJSONObject(i);
+                    BigDecimal total = new BigDecimal(object.getString("realizedPNL"));
+                    BigDecimal fee = new BigDecimal(object.getString("fee"));
+                    BigDecimal funding = new BigDecimal(object.getString("funding"));
+                    BigDecimal totalReady = total.subtract(fee).subtract(funding);
+
+                    orders.add(new PositionsModel(
+                            object.getString("positionId"),
+                            object.getString("symbol"),
+                            object.getString("side"),
+                            null,
+                            String.valueOf(object.getInt("leverage")),
+                            object.getString("realizedPNL"),
+                            object.getString("entryPrice"),
+                            object.getString("closePrice"),
+                            "close",
+                            totalReady.toPlainString()
+                    ));
+                }
+            }
+        } catch (NetworkException e) {
+            logger.error("Error:", e);
+        }
+        return orders;
+    }
+
+    @Override
+    public OrderResult changeLeverge(UserEntity user, String pair, String side, int leverage) {
+        try {
+            String api = security.decrypt(user.getApiKey());
+            String secret = security.decrypt(user.getSecretKey());
+            String nonce = generateNonce();
+            String timestamp = String.valueOf(System.currentTimeMillis());
+            String method = "POST";
+            String path = "/api/v1/futures/account/change_leverage";
+
+            Map<String, String> orderMap = new HashMap<>();
+            orderMap.put("symbol", pair);
+            orderMap.put("leverage", String.valueOf(leverage));
+            orderMap.put("marginCoin", "USDT");
+
+            String body = objectMapper.writeValueAsString(orderMap);
+            custom.blue(body);
+
+
+            String sign = generateSignApi(api, secret, nonce, timestamp, method, body);
+
+            // 2. Формируем запрос
+            OkHttpClient client = new OkHttpClient().newBuilder().connectTimeout(10, TimeUnit.SECONDS)
+                    .readTimeout(10, TimeUnit.SECONDS).writeTimeout(10, TimeUnit.SECONDS).build();
+            Request request = new Request.Builder()
+                    .url(BITUNIX_API_BASE_URL + path)
+                    .post(RequestBody.create(body, MediaType.get("application/json")))
+                    .addHeader("api-key", api)
+                    .addHeader("sign", sign)
+                    .addHeader("nonce", nonce)
+                    .addHeader("timestamp", timestamp)
+                    .addHeader("language", "en-US")
+                    .addHeader("Content-Type", "application/json")
+                    .build();
+
+            // 3. Отправляем запрос
+            custom.info("Отправляем запрос");
+
+            try (Response response = client.newCall(request).execute()) {
+                String responseBody = Objects.requireNonNull(response.body()).string();
+                custom.warn(responseBody);
+                if (validateJsonResopnse(responseBody)) {
+                    return OrderResult.ok("Плечо сменено", "id", pair);
+                } else {
+                    return OrderResult.error("Invalid ti", "id", pair);
+                }
+            }
+        } catch (IOException e) {
+            logger.error("Произошла ошибка смены плеча в BitUnix: {}", e.getMessage());
+            throw new ApiException(e.getMessage());
+        } catch (Exception e) {
+            logger.error("Произошла критичиская ошибка смены плеча в BitUnix: ", e);
+            throw new ApiException(e.getMessage());
+        }
+    }
+
+    public void startPositionMonitor(UserEntity user, String symbol, Signal signal, BigDecimal size, BitUnixWS ws, BigDecimal margin, SymbolInfo info) {
+        Thread.startVirtualThread(() -> {
+            ws.setSymbol(symbol);
+            try {
+                ws.addPositionListener(symbol, position -> {
+                    custom.info("Position monitor worked.");
+                    if (!isPositioned.getT()) {
+                        placeStopLoss(user, position, signal.getStopLoss(), info);
+                        ws.setStopId(position.getPosId());
+                        custom.info("Setuped sl: {}", stopLossId);
+
+                        setupTP(signal, user, size, new BigDecimal(signal.getStopLoss()), position.getPosId(), margin, info, ws);
+                        custom.info("Setuped tp");
+                        isPositioned.setT(true);
+                    }
+                });
+            } catch (Exception e) {
+                logger.error("WebSocket ERROR: ", e);
+            }
+            ws.startMonitoring();
+        });
+    }
+
+    @Override
+    public List<Ticker> getAllTickers() {
+        List<Ticker> tickers = new ArrayList<>();
+        OkHttpClient client = new OkHttpClient().newBuilder().connectTimeout(100, TimeUnit.SECONDS)
+                .readTimeout(100, TimeUnit.SECONDS).writeTimeout(100, TimeUnit.SECONDS).build();
+        Request request = new Request.Builder()
+                .url(BITUNIX_API_BASE_URL + "/api/v1/futures/market/tickers")
+                .build();
+
+        try (Response response = client.newCall(request).execute()) {
+            String responseBody = Objects.requireNonNull(response.body()).string();
+
+            JSONObject ret = new JSONObject(responseBody);
+            JSONArray data = ret.getJSONArray("data");
+
+            for (int i = 0; i < data.length(); i++) {
+                JSONObject ticker = data.getJSONObject(i);
+                tickers.add(new Ticker(ticker.getString("symbol"), new BigDecimal(ticker.optString("lastPrice", "0.0")), new BigDecimal(ticker.optString("markPrice", "0.0"))));
+            }
+        } catch (Exception e) {
+            logger.error("ERR ", e);
+        }
+
+        return tickers;
+    }
+
+    @Override
+    public SymbolInfo getSymbolInfo(UserEntity user, String symbol) {
+        try {
+            JSONArray array = getResponseArray("https://fapi.bitunix.com/api/v1/futures/market/trading_pairs?symbols=" + symbol);
+            JSONObject object = Objects.requireNonNull(array).getJSONObject(0);
+
+            return new SymbolInfo(symbol, object.optString("base", symbol.replace("USDT", "")), Integer.parseInt(object.optString("quotePrecision", "1")), Integer.parseInt(object.optString("basePrecision", "1")), new BigDecimal(object.getString("minTradeVolume")), Integer.parseInt(object.optString("maxLeverage", "1")), new BigDecimal("0.0001"));
+        } catch (Exception e) {
+            logger.error("SymbolInfo getting error: ", e);
+        }
+        return new SymbolInfo();
+    }
+
+    @Override
+    public OrderResult modifyOrder(UserEntity user, Map<String, String> payload) {
+        printPart("updating order");
+        System.out.println("\n\n");
+        String pair = "";
+
+        try {
+
+            String response = postToBitUnix("/api/v1/futures/trade/modify_order", user, objectMapper.writeValueAsString(payload));
+            custom.blue("{}", payload);
+            custom.warn(response);
+            // 4. Парсим ответ
+            JsonNode root = objectMapper.readTree(response);
+            if (!validateJsonResopnse(response)) {
+                logger.warn("Order not modified");
+            } else {
+                String oId = root.path("data").path("orderId").asText();
+                logger.info("Order modified success: {}", oId);
+
+                return OrderResult.ok("Order modified", oId, pair);
+            }
+
+        } catch (Exception e) {
+            logger.error("Order modifiing failed for symbol {}: {}", pair, e.getMessage());
+            return OrderResult.error(e.getMessage(), "none", pair);
+        }
+        return OrderResult.no();
+    }
+
+    @Override
+    public void setMarginMode(UserEntity user, String mode, String symbol) {
+        printPart("CHANGING MARGIN MODE");
+        try {
+            Map<String, String> payload = new HashMap<>();
+            payload.put("marginMode", mode.toUpperCase());
+            payload.put("symbol", symbol);
+            payload.put("marginCoin", "USDT");
+
+            String payloadJson = objectMapper.writeValueAsString(payload);
+            logger.info("Payload to modify margin mode formed: {}", payloadJson);
+            String response = postToBitUnix("/api/v1/futures/account/change_margin_mode", user, payloadJson);
+            custom.warn(response);
+            boolean isValid = validateJsonResopnse(response);
+            if (isValid) {
+                custom.info("Margin mode changed successfuly");
+            } else {
+                custom.error("Margin mode not changed");
+            }
+        } catch (Exception e) {
+            logger.error("Margin-mode change error: ", e);
+        }
+        printPart("margin mode changed");
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.plovdev.bot.modules.beerjes.bitget;
+
+import com.plovdev.bot.modules.beerjes.BitGetTradeService;
+import com.plovdev.bot.modules.beerjes.Order;
+import com.plovdev.bot.modules.beerjes.Position;
+import com.plovdev.bot.modules.beerjes.TakeProfitLevel;
+import com.plovdev.bot.modules.beerjes.monitoring.BitGetWS;
+import com.plovdev.bot.modules.beerjes.utils.BeerjUtils;
+import com.plovdev.bot.modules.databases.UserEntity;
+import com.plovdev.bot.modules.models.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.math.BigDecimal;
+import java.util.*;
+
+public class BitGetTakesSetuper {
+    private final Logger logger = LoggerFactory.getLogger("TakeSetuper");
+    private final com.plovdev.bot.modules.logging.Logger custom = new com.plovdev.bot.modules.logging.Logger();
+    private final BitGetTradeService service;
+    private final SettingsService settings = new SettingsService();
+    private final BitGetStopLossTrailer trailer;
+    private final StopInProfitTrigger trigger;
+
+    public BitGetTakesSetuper(StopInProfitTrigger trg, BitGetTradeService service, BitGetStopLossTrailer st) {
+        this.service = service;
+        trailer = st;
+        trigger = trg;
+    }
+
+
+    public List<Map<String, String>> placeTakes(BigDecimal positionSize, List<TakeProfitLevel> tpLevels, String symbol, String direction) {
+        System.out.println(positionSize + " - Position size");
+        List<Map<String, String>> orders = new ArrayList<>();
+        for (TakeProfitLevel level : tpLevels) {
+            System.out.println(level);
+            BigDecimal size = level.getSize();
+
+            Map<String, String> payload = new HashMap<>();
+            payload.put("symbol", symbol); // Добавляем суффикс для фьючерсов!
+            payload.put("productType", "USDT-FUTURES"); // В ВЕРХНЕМ РЕГИСТРЕ!
+            payload.put("marginMode", "isolated"); // Обязательный параметр
+            payload.put("marginCoin", "USDT"); // В ВЕРХНЕМ РЕГИСТРЕ!
+            payload.put("size", size.toPlainString());
+            payload.put("side", direction.equalsIgnoreCase("long") ? "BUY" : "SELL");
+            payload.put("tradeSide", "close");
+            payload.put("orderType", "limit");
+            payload.put("price", level.getPrice().toPlainString());
+            payload.put("force", "gtc"); // Обязательно для лимитных ордеров!
+            payload.put("reduceOnly", "yes"); // КРИТИЧЕСКИ ВАЖНО - только закрытие!
+            orders.add(payload);
+        }
+        return orders;
+    }
+
+    public void manageTakesInMonitor(BitGetWS ws, String symbol, UserEntity user, List<Map<String, String>> orders, String stopLossId, List<TakeProfitLevel> tpLevels, SymbolInfo info, BigDecimal positionSize, String direction) {
+        TypeValueSwitcher<Boolean> isOrdered = new TypeValueSwitcher<>(false);
+        List<OrderResult> ids = new ArrayList<>(service.placeOrders(user, symbol, orders).stream().filter(OrderResult::succes).toList());
+        System.out.println(ids);
+
+        TakeProfitLevel firstLlevel = tpLevels.getFirst();
+        ws.addOrderListener(symbol, inputOrder -> {
+            String posSide = inputOrder.getPosSide();
+            String tradeSide = inputOrder.getTradeSide();
+            String orderId = inputOrder.getOrderId();
+
+            if (tradeSide.equalsIgnoreCase("open")) {
+                Position position = service.getPositions(user).stream().filter(p -> p.getSymbol().equals(symbol) && p.getHoldSide().equalsIgnoreCase(direction)).toList().getFirst();
+                List<TakeProfitLevel> newTakes = BeerjUtils.reAdjustTakeProfits(position.getTotal(), tpLevels, info, service.getEntryPrice(symbol), direction);
+                List<Order> orderList = service.getOrders(user).stream().filter(o -> o.getSymbol().equals(symbol) && o.getTradeSide().equalsIgnoreCase("close")).toList();
+                for (int i = 0; i < newTakes.size(); i++) {
+                    Order o = orderList.get(i);
+                    TakeProfitLevel level = newTakes.get(i);
+                    Map<String, String> payload = new HashMap<>();
+                    System.out.println(o.getOrderId());
+                    payload.put("orderId", o.getOrderId());
+                    payload.put("symbol", symbol);
+                    payload.put("productType", "USDT-FUTURES");
+                    payload.put("newSize", level.getSize().toPlainString());
+                    payload.put("newPrice", o.getPrice().toPlainString());
+                    payload.put("newClientOid", "BITGET#" + o.getOrderId());
+
+                    ids.set(i, service.modifyOrder(user, payload));
+                    tpLevels.set(i, level);
+                }
+            }
+
+            System.out.println(isOrdered.getT() + " - isOrdered");
+            if (!isOrdered.getT()) {
+                if (isTakeHit(inputOrder, tpLevels, ids)) {
+                    try {
+                        logger.info("Fisrt take-profit(id: {}) is hit!", orderId);
+                        List<Order> ordersList = service.getOrders(user);
+                        List<Order> toCancel = new ArrayList<>();
+
+                        for (Order order : ordersList) {
+                            custom.blue("Order to cancel by first tp: symbol: {}, tradeSide: {}", order.getSymbol(), order.getTradeSide());
+                            if (order.getSymbol().equals(symbol) && order.getTradeSide().equalsIgnoreCase("open")) {
+                                custom.info("To cancel added a new order: {}", order);
+                                toCancel.add(order);
+                            }
+                        }
+                        custom.info("Order to cancel by first take: {}", toCancel);
+                        for (Order order : toCancel) {
+                            service.closeOrder(user, order);
+                        }
+                        //---------------------------------------LIMITS CANCELED------------------------------------------\\
+                        if (settings.getStopInProfitVariant(user.getGroup()).equals("take")) {
+                            System.out.println("STOP LOSS before trailing: " + stopLossId);
+                            OrderResult stopOrder = trailer.trailStopByFirstTakeHit(user, symbol, posSide, stopLossId, info.getPricePlace());
+                            if (stopOrder.succes()) {
+                                ws.close();
+                            }
+                            System.out.println("Stop order: " + stopOrder);
+                        }
+                        isOrdered.setT(true);
+                    } catch (Exception e) {
+                        logger.info("Fisrt TP hit error: ", e);
+                    }
+                }
+            }
+        });
+    }
+    private boolean isTakeHit(Order inputOrder, List<TakeProfitLevel> tpLevels, List<OrderResult> ids) {
+        logger.info("Data params to calc, is first take hit?");
+        tpLevels.sort(Comparator.comparing(TakeProfitLevel::getPrice));
+        String posSide = inputOrder.getPosSide();
+
+        logger.info("Order side: {}, Tp levels: {} ids: {}", posSide, tpLevels, ids);
+        if (posSide.equalsIgnoreCase("short") || posSide.equalsIgnoreCase("sell")) {
+            tpLevels = tpLevels.reversed();
+            ids = ids.reversed();
+        }
+        TakeProfitLevel level = tpLevels.get(trigger.getTakeToTrailNumber());
+        logger.info("First level is: {}", level);
+
+        boolean isId = inputOrder.getOrderId().equals(ids.get(trigger.getTakeToTrailNumber()).id());
+        boolean isPrice = (inputOrder.getPrice().compareTo(level.getPrice()) == 0);
+        boolean isClose = inputOrder.getTradeSide().equalsIgnoreCase("close");
+
+        logger.info("Order id: {}, first id: {}, Is id? - {}", inputOrder.getOrderId(), ids.get(trigger.getTakeToTrailNumber()).id(), isId);
+
+        logger.info("Input order price: {}, first price: {}, Is price? - {}", inputOrder.getPrice(), level.getPrice(), isPrice);
+        logger.info("Input order trade side: {}, first trade side: close - must, Is TS? - {}", inputOrder.getTradeSide(), isClose);
+
+        boolean finalResult = isId || (isPrice && isClose);
+        logger.info("Final result, is first tp? - {}", finalResult);
+
+        return finalResult;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.plovdev.bot.modules.beerjes.bitunix;
+
+import com.plovdev.bot.modules.beerjes.BitUnixTradeService;
+import com.plovdev.bot.modules.beerjes.Order;
+import com.plovdev.bot.modules.beerjes.Position;
+import com.plovdev.bot.modules.beerjes.TakeProfitLevel;
+import com.plovdev.bot.modules.beerjes.monitoring.BitUnixWS;
+import com.plovdev.bot.modules.beerjes.utils.BeerjUtils;
+import com.plovdev.bot.modules.databases.UserEntity;
+import com.plovdev.bot.modules.models.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.math.BigDecimal;
+import java.util.*;
+
+public class BitUnixTakesSetuper {
+    private final Logger logger = LoggerFactory.getLogger("TakeSetuper");
+    private final com.plovdev.bot.modules.logging.Logger custom = new com.plovdev.bot.modules.logging.Logger();
+    private final BitUnixTradeService service;
+    private final SettingsService settings = new SettingsService();
+    private final BitUnixStopLossTrailer trailer;
+    private final StopInProfitTrigger trigger;
+
+    public BitUnixTakesSetuper(StopInProfitTrigger tgr, BitUnixTradeService service, BitUnixStopLossTrailer st) {
+        this.service = service;
+        trailer = st;
+        trigger = tgr;
+    }
+
+    public void manageTakesInMonitor(BitUnixWS ws, String symbol, UserEntity user, List<OrderResult> ids, String stopLossId, List<TakeProfitLevel> tpLevels, SymbolInfo info, String direction) {
+        TypeValueSwitcher<Boolean> isOrdered = new TypeValueSwitcher<>(false);
+
+        TakeProfitLevel firstLlevel = tpLevels.getFirst();
+        ws.addOrderListener(symbol, inputOrder -> {
+            String side = inputOrder.getTradeSide();
+            String orderId = inputOrder.getOrderId();
+
+            if (side.equalsIgnoreCase("open")) {
+
+                // Минимальный сон (100-500мс), чтобы дать API закончить транзакцию. 1000мс было слишком долго.
+                try {
+                    Thread.sleep(1000);
+
+                    // ---------- 1. БЕЗОПАСНЫЙ ПОИСК ПОЗИЦИИ ----------
+                    List<Position> foundPositions = service.getPositions(user).stream().filter(p -> {
+                        String symb = p.getSymbol();
+                        boolean isSymb = symb.equals(symbol);
+                        String hs = p.getHoldSide().toLowerCase();
+                        boolean isLong = hs.equals("buy") || hs.equals("long");
+                        String directionMatch = isLong ? "LONG" : "SHORT";
+                        return isSymb && directionMatch.equalsIgnoreCase(direction);
+                    }).toList();
+
+                    if (foundPositions.isEmpty()) {
+                        logger.warn("Position not found after open event for symbol: {}. Skipping TP adjustment.", symbol);
+                        return;
+                    }
+
+                    Position position = foundPositions.getFirst();
+
+                    // ---------- 2. БЕЗОПАСНОЕ ИЗВЛЕЧЕНИЕ РАЗМЕРА ----------
+                    BigDecimal totalSize = (position.getTotal() != null) ? position.getTotal() : BigDecimal.ZERO;
+
+                    if (totalSize.compareTo(BigDecimal.ZERO) <= 0) {
+                        logger.warn("Position total size is zero or null ({}). Cannot adjust takes.", totalSize);
+                        return;
+                    }
+
+                    // ---------- 3. ПЕРЕСЧЕТ ОБЪЕМОВ (с гарантией точности из BeerjUtils) ----------
+                    // Этот вызов вернет список newTakes, сумма объемов которого ТОЧНО равна totalSize
+                    List<TakeProfitLevel> newTakes = BeerjUtils.reAdjustTakeProfitsBU(totalSize, tpLevels, info, service.getEntryPrice(symbol), inputOrder.getPosSide());
+
+                    // ---------- 4. МОДИФИКАЦИЯ ОРДЕРОВ С СОРТИРОВКОЙ ----------
+                    // Получаем открытые тейк-профиты
+                    List<Order> orderList = service.getOrders(user).stream()
+                            .filter(o -> o.getSymbol().equals(symbol) && o.isReduceOnly())
+                            // КРИТИЧНО: Сортируем ордера по цене, чтобы гарантировать совпадение с newTakes
+                            .sorted(Comparator.comparing(Order::getPrice))
+                            .toList();
+
+                    if (orderList.size() != newTakes.size()) {
+                        logger.error("CRITICAL MISMATCH: Number of open TP orders ({}) does not match new TP levels ({}). Check logic.",
+                                orderList.size(), newTakes.size());
+                        return;
+                    }
+
+                    // Цикл модификации
+                    for (int i = 0; i < orderList.size(); i++) {
+                        Order o = orderList.get(i);
+                        TakeProfitLevel level = newTakes.get(i);
+
+                        Map<String, String> payload = new HashMap<>();
+                        payload.put("orderId", o.getOrderId());
+                        payload.put("qty", level.getSize().toPlainString());
+                        payload.put("price", o.getPrice().toPlainString());
+
+                        ids.set(i, service.modifyOrder(user, payload));
+                    }
+                } catch (Exception e) {
+                    System.out.println("Sleep error");
+                }
+            }
+
+
+            if (orderId.equals(stopLossId)) {
+                logger.info("Stop-loss(id: {}) is hit!", orderId);
+
+                List<Order> ordersList = service.getOrders(user);
+                List<Order> toCancel = new ArrayList<>();
+
+                for (Order order : ordersList) {
+                    if (order.getSymbol().equals(symbol)) {
+                        toCancel.add(order);
+                    }
+                }
+
+                custom.info("Orders to cancel: {}", toCancel);
+                service.cancelLimits(user, symbol, toCancel.stream().map(Order::getOrderId).toList());
+            }
+            System.out.println(isOrdered.getT() + " - isOrdered");
+            if (!isOrdered.getT()) {
+                if (isTakeHit(inputOrder, tpLevels, ids)) {
+                    try {
+                        try {
+                            logger.info("Fisrt take-profit(id: {}) is hit!", orderId);
+                            List<Order> ordersList = service.getOrders(user).stream().filter(order -> {
+                                boolean isReduce = order.isReduceOnly();
+                                String s = order.getSymbol();
+                                logger.info("Is reduce: {}, symbol: {}", isReduce, symbol);
+                                return s.equals(symbol) && !isReduce;
+                            }).toList();
+
+                            logger.info("Orders to cancel: {}", ordersList);
+                            for (Order order : ordersList) {
+                                service.closeOrder(user, order);
+                            }
+                        } catch (Exception e) {
+                            logger.error("Err: ", e);
+                        }
+                        //---------------------------------------LIMITS CANCELED------------------------------------------\\
+                        if (trigger.isTakeVariant()) {
+                            System.out.println("STOP LOSS before trailing: " + stopLossId);
+                            if (trailer.trailStopByFirstTakeHit(user, symbol, side, stopLossId, info.getPricePlace()).succes()) {
+                                System.out.println("Stop trailing success");
+                            }
+                        }
+                        isOrdered.setT(true);
+                    } catch (Exception e) {
+                        logger.info("Fisrt TP hit error: ", e);
+                    }
+                }
+            }
+        });
+    }
+
+    private boolean isTakeHit(Order inputOrder, List<TakeProfitLevel> tpLevels, List<OrderResult> ids) {
+        logger.info("Data params to calc, is first take hit?");
+        tpLevels.sort(Comparator.comparing(TakeProfitLevel::getPrice));
+        String posSide = inputOrder.getPosSide();
+
+        logger.info("Order side: {}, Tp levels: {} ids: {}", posSide, tpLevels, ids);
+        if (posSide.equalsIgnoreCase("long") || posSide.equalsIgnoreCase("buy")) {
+            tpLevels = tpLevels.reversed();
+            ids = ids.reversed();
+        }
+        TakeProfitLevel level = tpLevels.get(trigger.getTakeToTrailNumber());
+        logger.info("First level is: {}", level);
+
+        boolean isId = inputOrder.getOrderId().equals(ids.get(trigger.getTakeToTrailNumber()).id());
+        boolean isPrice = (inputOrder.getPrice().compareTo(level.getPrice()) == 0);
+        boolean isClose = inputOrder.getTradeSide().equalsIgnoreCase("close");
+
+        logger.info("Order id: {}, first id: {}, Is id? - {}", inputOrder.getOrderId(), ids.get(trigger.getTakeToTrailNumber()).id(), isId);
+
+        logger.info("Input order price: {}, first price: {}, Is price? - {}", inputOrder.getPrice(), level.getPrice(), isPrice);
+        logger.info("Input order trade side: {}, first trade side: close - must, Is TS? - {}", inputOrder.getTradeSide(), isClose);
+
+        boolean finalResult = isId || (isPrice && isClose);
+        logger.info("Final result, is first tp? - {}", finalResult);
+
+        return finalResult;
+    }
+}
